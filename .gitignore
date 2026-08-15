@@ -1,0 +1,17 @@
+# Build artifacts
+target/
+*.efi
+*.iso
+*.img
+*.vdi
+
+# OS & Editor metadata
+.DS_Store
+*.swp
+*~
+
+# VM logs and sockets
+*.log
+*.sock
+*.nvram
+*.png
