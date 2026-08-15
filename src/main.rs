@@ -8,6 +8,7 @@ pub mod idt;
 pub mod logger;
 pub mod panic;
 pub mod platform;
+pub mod timer;
 
 type EfiHandle = *mut u8;
 type EfiStatus = usize;
@@ -99,6 +100,9 @@ fn kernel_main() -> ! {
     initialize_gdt();
     initialize_idt();
     initialize_apic();
+    initialize_timer();
+
+    platform::sti();
 
     klog!("[BOOT] Kernel initialization complete");
     klog!("[KERNEL] entering main loop");
@@ -135,7 +139,10 @@ fn initialize_apic() {
     klog!("[BOOT] Local APIC initialized");
     klog!("[BOOT] I/O APIC initialized");
     klog!("[BOOT] Hardware IRQ routing enabled");
-    platform::sti();
+}
+
+fn initialize_timer() {
+    timer::init();
 }
 
 fn kernel_main_loop() -> ! {

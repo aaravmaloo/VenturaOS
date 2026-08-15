@@ -15,6 +15,9 @@ pub const LAPIC_LVT_TIMER: u32 = 0x0320;
 pub const LAPIC_LVT_LINT0: u32 = 0x0350;
 pub const LAPIC_LVT_LINT1: u32 = 0x0360;
 pub const LAPIC_LVT_ERROR: u32 = 0x0370;
+pub const LAPIC_TIMER_ICR: u32 = 0x0380;
+pub const LAPIC_TIMER_CCR: u32 = 0x0390;
+pub const LAPIC_TIMER_DCR: u32 = 0x03E0;
 
 pub const IOAPIC_REGSEL: usize = 0x00;
 pub const IOAPIC_IOWIN: usize  = 0x10;
@@ -112,4 +115,10 @@ pub unsafe fn mask_irq(irq: u8) {
     let reg_low = 0x10 + 2 * irq;
     let low = ioapic_read(reg_low) | (1 << 16);
     ioapic_write(reg_low, low);
+}
+
+pub unsafe fn start_lapic_timer(vector: u8, initial_count: u32, divide_cfg: u32) {
+    lapic_write(LAPIC_TIMER_DCR, divide_cfg);
+    lapic_write(LAPIC_LVT_TIMER, 0x0002_0000 | (vector as u32));
+    lapic_write(LAPIC_TIMER_ICR, initial_count);
 }

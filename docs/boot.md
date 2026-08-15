@@ -69,6 +69,10 @@ qemu-system-x86_64 -cdrom ventura.iso -bios /path/to/OVMF.fd -m 256M
 [BOOT] Local APIC initialized
 [BOOT] I/O APIC initialized
 [BOOT] Hardware IRQ routing enabled
+[TIMER] initialized (Local APIC periodic mode)
 [BOOT] Kernel initialization complete
 [KERNEL] entering main loop
+[TIMER] tick: 100
+[TIMER] tick: 200
+[TIMER] tick: 300
 ```

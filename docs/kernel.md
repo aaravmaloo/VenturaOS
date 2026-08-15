@@ -20,7 +20,9 @@ efi_main(image_handle, system_table)
        ├─ initialize_platform()   ← logs platform details
        ├─ initialize_gdt()        ← installs Ventura GDT, TSS, reloads CS/SS/TR
        ├─ initialize_idt()        ← installs 256-entry IDT & exception/IRQ stubs
-       ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC, enables STI
+       ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC
+       ├─ initialize_timer()      ← registers IRQ 0 & starts LAPIC periodic timer
+       ├─ platform::sti()         ← enables hardware interrupts
        │
        └─ kernel_main_loop()      ← platform::hlt() loop
 ```
@@ -48,19 +50,16 @@ Ventura establishes its own flat 64-bit GDT with descriptors configured for mode
 | Vectors | Allocation | Description |
 |---|---|---|
 | `0..31` | CPU Exceptions | Hardware faults & traps (#DE, #BP, #UD, #PF, etc.) |
-| `32..47` (`0x20..0x2F`) | Hardware IRQs 0..15 | External device interrupts routed via I/O APIC |
+| `32..47` (`0x20..0x2F`) | Hardware IRQs 0..15 | External device interrupts routed via I/O APIC / LAPIC |
 | `48..254` | General / PCI | Reserved for PCI device lines |
 | `255` (`0xFF`) | APIC Spurious | Local APIC Spurious Interrupt Vector |
 
 ### Hardware Interrupt Routing Flow
 
 ```
-Hardware Device (e.g. COM1 UART)
+Hardware Device (e.g. LAPIC Timer or COM1 UART)
   │
-  ├─ Asserts physical IRQ line (e.g. IRQ 4)
-  │
-  ├─ I/O APIC (Redirection Table 0xFEC0_0000)
-  │    └─ Maps IRQ pin to interrupt vector (Vector 32 + IRQ)
+  ├─ Generates IRQ (e.g. IRQ 0 / Vector 32)
   │
   ├─ Local APIC (0xFEE0_0000)
   │    └─ Delivers interrupt to CPU core
@@ -77,6 +76,15 @@ Hardware Device (e.g. COM1 UART)
   │    └─ Executes iretq
 ```
 
+## Hardware Timer & Monotonic Ticks (`src/timer.rs`)
+
+Ventura uses the built-in **Local APIC Timer** running in **Periodic Mode**:
+- **Vector**: `32` (`0x20` / IRQ 0).
+- **Divider**: Configured via `LAPIC_TIMER_DCR` to Divide by 16 (`0x03`).
+- **Initial Count**: Loaded into `LAPIC_TIMER_ICR` (`0x0010_0000`).
+- **Tick Counter**: Increments an atomic 64-bit integer (`current_ticks() -> u64`) on every timer interrupt.
+- **Diagnostic Interval**: Emits `[TIMER] tick: N` every 100 ticks to avoid serial output saturation.
+
 ## Logging (`src/logger.rs`)
 
 Provides the `klog!` macro backed by an `AtomicPtr<EfiSimpleTextOutput>` in writable memory, formatting directly into the UEFI console without heap allocations.
@@ -90,4 +98,4 @@ Formats the panic message and source location, prints a `[KERNEL PANIC]` box, an
 - `hlt()` / `halt() -> !` — Low-power CPU halt.
 - `sti()` / `cli()` — Hardware interrupt control.
 - `rdmsr()` / `wrmsr()` — Model-Specific Register read/write.
-- `inb`/`outb`, `inw`/`outw`, `inl`/`outl` — x86 I/O port primitives (COM1 `0x3F8`, etc.).
+- `inb`/`outb`, `inw`/`outw`, `inl`/`outl` — x86 I/O port primitives.
