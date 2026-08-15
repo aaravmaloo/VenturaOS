@@ -2,6 +2,8 @@
 #![no_main]
 #![allow(private_interfaces)]
 
+pub mod gdt;
+pub mod idt;
 pub mod logger;
 pub mod panic;
 pub mod platform;
@@ -93,6 +95,8 @@ fn kernel_main() -> ! {
 
     initialize_logging();
     initialize_platform();
+    initialize_gdt();
+    initialize_idt();
 
     klog!("[BOOT] Kernel initialization complete");
     klog!("[KERNEL] entering main loop");
@@ -106,6 +110,18 @@ fn initialize_logging() {
 
 fn initialize_platform() {
     klog!("[BOOT] Platform: x86_64 / UEFI boot services");
+}
+
+fn initialize_gdt() {
+    gdt::init();
+    klog!("[BOOT] GDT initialized");
+    klog!("[BOOT] TSS initialized");
+}
+
+fn initialize_idt() {
+    idt::init();
+    klog!("[BOOT] IDT initialized");
+    klog!("[BOOT] Exception handlers installed");
 }
 
 fn kernel_main_loop() -> ! {
