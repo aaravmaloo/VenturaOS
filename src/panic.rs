@@ -4,6 +4,8 @@ use crate::platform;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    platform::cli();
+
     let mut w = KernelWriter;
 
     let _ = w.write_str("\r\n[KERNEL PANIC]\r\n");

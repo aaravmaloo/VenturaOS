@@ -308,12 +308,14 @@ pub fn register_irq(irq: u8, handler: fn(irq: u8)) {
 }
 
 #[no_mangle]
-pub extern "C" fn irq_dispatcher(irq: u8) {
-    let handler = unsafe { (*IRQ_HANDLERS.0.get())[irq as usize] };
-    if let Some(h) = handler {
-        h(irq);
-    } else {
-        klog!("[IRQ] Unhandled hardware IRQ {}", irq);
+pub extern "sysv64" fn irq_dispatcher(irq: u64) {
+    if (irq as usize) < 16 {
+        let handler = unsafe { (*IRQ_HANDLERS.0.get())[irq as usize] };
+        if let Some(h) = handler {
+            h(irq as u8);
+        } else {
+            klog!("[IRQ] Unhandled hardware IRQ {}", irq);
+        }
     }
 
     unsafe {
@@ -357,7 +359,7 @@ const EXCEPTION_NAMES: [&str; 32] = [
 ];
 
 #[no_mangle]
-pub extern "C" fn exception_dispatcher(frame: &ExceptionFrame) {
+pub extern "sysv64" fn exception_dispatcher(frame: &ExceptionFrame) {
     let vector = frame.vector as usize;
     let name = if vector < EXCEPTION_NAMES.len() {
         EXCEPTION_NAMES[vector]
