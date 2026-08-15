@@ -1,10 +1,14 @@
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering};
 use crate::klog;
 use crate::platform;
 
 pub const IRQ_BASE_VECTOR: u8 = 32;
+pub const SPURIOUS_VECTOR: u8 = 255;
+
+pub type IrqHandler = fn(irq: u8);
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -72,7 +76,13 @@ struct SyncCell<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for SyncCell<T> {}
 
 static IDT: SyncCell<InterruptDescriptorTable> = SyncCell(UnsafeCell::new(InterruptDescriptorTable::new()));
-static IRQ_HANDLERS: SyncCell<[Option<fn(irq: u8)>; 16]> = SyncCell(UnsafeCell::new([None; 16]));
+static IRQ_HANDLERS: SyncCell<[Option<IrqHandler>; 16]> = SyncCell(UnsafeCell::new([None; 16]));
+static UNHANDLED_IRQ_COUNT: [AtomicU32; 16] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
 
 #[repr(C)]
 #[derive(Debug)]
@@ -110,6 +120,8 @@ pub struct ExceptionFrame {
 extern "C" {
     static exception_stubs: [usize; 32];
     static irq_stubs: [usize; 16];
+    fn generic_irq_stub();
+    fn spurious_irq_stub();
 }
 
 global_asm!(r#"
@@ -259,6 +271,49 @@ IRQ_STUB 13
 IRQ_STUB 14
 IRQ_STUB 15
 
+.global generic_irq_stub
+generic_irq_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    call generic_interrupt_dispatcher
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    iretq
+
+.global spurious_irq_stub
+spurious_irq_stub:
+    /* Spurious interrupts do not set ISR bit, so no EOI is issued per Intel spec */
+    iretq
+
 .section .data
 .global exception_stubs
 .align 8
@@ -285,26 +340,57 @@ pub fn init() {
     unsafe {
         let idt = &mut *IDT.0.get();
 
+        // 1. Exception vectors 0..31
         for vector in 0..32 {
             idt.set_entry(vector, exception_stubs[vector]);
         }
 
+        // 2. Hardware IRQ vectors 32..47 (IRQs 0..15)
         for irq in 0..16 {
             idt.set_entry(IRQ_BASE_VECTOR as usize + irq, irq_stubs[irq]);
         }
+
+        // 3. Generic handler for remaining vectors 48..254
+        for vector in 48..255 {
+            idt.set_entry(vector, generic_irq_stub as *const () as usize);
+        }
+
+        // 4. Dedicated Spurious Interrupt vector 255 (no EOI per APIC spec)
+        idt.set_entry(SPURIOUS_VECTOR as usize, spurious_irq_stub as *const () as usize);
 
         let ptr = idt.pointer();
         asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
     }
 }
 
-pub fn register_irq(irq: u8, handler: fn(irq: u8)) {
-    if (irq as usize) < 16 {
+pub fn register_irq(irq: u8, handler: IrqHandler) -> Result<(), &'static str> {
+    if (irq as usize) >= 16 {
+        return Err("IRQ index out of valid range (0..15)");
+    }
+
+    platform::without_interrupts(|| {
         unsafe {
             let handlers = &mut *IRQ_HANDLERS.0.get();
             handlers[irq as usize] = Some(handler);
         }
+    });
+
+    Ok(())
+}
+
+pub fn unregister_irq(irq: u8) -> Result<(), &'static str> {
+    if (irq as usize) >= 16 {
+        return Err("IRQ index out of valid range (0..15)");
     }
+
+    platform::without_interrupts(|| {
+        unsafe {
+            let handlers = &mut *IRQ_HANDLERS.0.get();
+            handlers[irq as usize] = None;
+        }
+    });
+
+    Ok(())
 }
 
 #[no_mangle]
@@ -314,8 +400,24 @@ pub extern "sysv64" fn irq_dispatcher(irq: u64) {
         if let Some(h) = handler {
             h(irq as u8);
         } else {
-            klog!("[IRQ] Unhandled hardware IRQ {}", irq);
+            let count = UNHANDLED_IRQ_COUNT[irq as usize].fetch_add(1, Ordering::Relaxed);
+            if count < 5 {
+                klog!("[IRQ] Unhandled hardware IRQ {}", irq);
+            }
         }
+    }
+
+    unsafe {
+        crate::apic::eoi();
+    }
+}
+
+#[no_mangle]
+pub extern "sysv64" fn generic_interrupt_dispatcher() {
+    static UNEXPECTED_COUNT: AtomicU32 = AtomicU32::new(0);
+    let count = UNEXPECTED_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 5 {
+        klog!("[IRQ] Unexpected external interrupt received");
     }
 
     unsafe {
@@ -447,7 +549,7 @@ fn com1_test_handler(irq: u8) {
 }
 
 pub fn test_hardware_irq() {
-    register_irq(4, com1_test_handler);
+    let _ = register_irq(4, com1_test_handler);
     unsafe {
         crate::apic::unmask_irq(4);
         platform::outb(platform::COM1_PORT + 1, 0x02);

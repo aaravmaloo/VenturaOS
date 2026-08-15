@@ -34,6 +34,31 @@ pub fn cli() {
 }
 
 #[inline(always)]
+pub fn are_interrupts_enabled() -> bool {
+    let rflags: u64;
+    unsafe {
+        asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
+    }
+    (rflags & (1 << 9)) != 0
+}
+
+#[inline(always)]
+pub fn without_interrupts<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let enabled = are_interrupts_enabled();
+    if enabled {
+        cli();
+    }
+    let res = f();
+    if enabled {
+        sti();
+    }
+    res
+}
+
+#[inline(always)]
 pub unsafe fn inb(port: u16) -> u8 {
     let value: u8;
     asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));

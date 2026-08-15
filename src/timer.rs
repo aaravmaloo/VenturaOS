@@ -26,7 +26,7 @@ fn timer_irq_handler(_irq: u8) {
 }
 
 pub fn init() {
-    idt::register_irq(TIMER_IRQ, timer_irq_handler);
+    let _ = idt::register_irq(TIMER_IRQ, timer_irq_handler);
 
     unsafe {
         crate::apic::start_lapic_timer(TIMER_VECTOR, TIMER_INITIAL_COUNT, TIMER_DIVIDE_16);
