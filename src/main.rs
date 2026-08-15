@@ -2,6 +2,7 @@
 #![no_main]
 #![allow(private_interfaces)]
 
+pub mod apic;
 pub mod gdt;
 pub mod idt;
 pub mod logger;
@@ -97,6 +98,7 @@ fn kernel_main() -> ! {
     initialize_platform();
     initialize_gdt();
     initialize_idt();
+    initialize_apic();
 
     klog!("[BOOT] Kernel initialization complete");
     klog!("[KERNEL] entering main loop");
@@ -122,6 +124,18 @@ fn initialize_idt() {
     idt::init();
     klog!("[BOOT] IDT initialized");
     klog!("[BOOT] Exception handlers installed");
+}
+
+fn initialize_apic() {
+    unsafe {
+        apic::disable_pic();
+        apic::init_lapic();
+        apic::init_ioapic();
+    }
+    klog!("[BOOT] Local APIC initialized");
+    klog!("[BOOT] I/O APIC initialized");
+    klog!("[BOOT] Hardware IRQ routing enabled");
+    platform::sti();
 }
 
 fn kernel_main_loop() -> ! {

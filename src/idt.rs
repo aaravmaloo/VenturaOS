@@ -4,6 +4,8 @@ use core::mem::size_of;
 use crate::klog;
 use crate::platform;
 
+pub const IRQ_BASE_VECTOR: u8 = 32;
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 pub struct IdtEntry {
@@ -33,7 +35,7 @@ impl IdtEntry {
         self.offset_low = (handler & 0xFFFF) as u16;
         self.selector = crate::gdt::KERNEL_CODE_SELECTOR;
         self.ist = 0;
-        self.type_attr = 0x8E; // Present (0x80) | Ring 0 (0x00) | 64-bit Interrupt Gate (0x0E)
+        self.type_attr = 0x8E;
         self.offset_mid = ((handler >> 16) & 0xFFFF) as u16;
         self.offset_high = (handler >> 32) as u32;
         self.reserved = 0;
@@ -70,6 +72,7 @@ struct SyncCell<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for SyncCell<T> {}
 
 static IDT: SyncCell<InterruptDescriptorTable> = SyncCell(UnsafeCell::new(InterruptDescriptorTable::new()));
+static IRQ_HANDLERS: SyncCell<[Option<fn(irq: u8)>; 16]> = SyncCell(UnsafeCell::new([None; 16]));
 
 #[repr(C)]
 #[derive(Debug)]
@@ -106,22 +109,22 @@ pub struct ExceptionFrame {
 
 extern "C" {
     static exception_stubs: [usize; 32];
+    static irq_stubs: [usize; 16];
 }
 
 global_asm!(r#"
 .macro EXCEPTION_NO_ERR vector
 .global stub_\vector
 stub_\vector:
-    push 0                  /* dummy error code */
-    push \vector            /* vector number */
+    push 0
+    push \vector
     jmp common_exception_entry
 .endm
 
 .macro EXCEPTION_ERR vector
 .global stub_\vector
 stub_\vector:
-    /* hardware pushed error code already */
-    push \vector            /* vector number */
+    push \vector
     jmp common_exception_entry
 .endm
 
@@ -176,7 +179,7 @@ common_exception_entry:
     push r14
     push r15
 
-    mov rdi, rsp            /* pass &ExceptionFrame to Rust */
+    mov rdi, rsp
     call exception_dispatcher
 
     pop r15
@@ -195,8 +198,66 @@ common_exception_entry:
     pop rbx
     pop rax
 
-    add rsp, 16             /* pop vector and error_code */
+    add rsp, 16
     iretq
+
+.macro IRQ_STUB irq
+.global irq_stub_\irq
+irq_stub_\irq:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rdi, \irq
+    call irq_dispatcher
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    iretq
+.endm
+
+IRQ_STUB 0
+IRQ_STUB 1
+IRQ_STUB 2
+IRQ_STUB 3
+IRQ_STUB 4
+IRQ_STUB 5
+IRQ_STUB 6
+IRQ_STUB 7
+IRQ_STUB 8
+IRQ_STUB 9
+IRQ_STUB 10
+IRQ_STUB 11
+IRQ_STUB 12
+IRQ_STUB 13
+IRQ_STUB 14
+IRQ_STUB 15
 
 .section .data
 .global exception_stubs
@@ -210,6 +271,14 @@ exception_stubs:
     .quad stub_20, stub_21, stub_22, stub_23
     .quad stub_24, stub_25, stub_26, stub_27
     .quad stub_28, stub_29, stub_30, stub_31
+
+.global irq_stubs
+.align 8
+irq_stubs:
+    .quad irq_stub_0,  irq_stub_1,  irq_stub_2,  irq_stub_3
+    .quad irq_stub_4,  irq_stub_5,  irq_stub_6,  irq_stub_7
+    .quad irq_stub_8,  irq_stub_9,  irq_stub_10, irq_stub_11
+    .quad irq_stub_12, irq_stub_13, irq_stub_14, irq_stub_15
 "#);
 
 pub fn init() {
@@ -220,8 +289,35 @@ pub fn init() {
             idt.set_entry(vector, exception_stubs[vector]);
         }
 
+        for irq in 0..16 {
+            idt.set_entry(IRQ_BASE_VECTOR as usize + irq, irq_stubs[irq]);
+        }
+
         let ptr = idt.pointer();
         asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
+    }
+}
+
+pub fn register_irq(irq: u8, handler: fn(irq: u8)) {
+    if (irq as usize) < 16 {
+        unsafe {
+            let handlers = &mut *IRQ_HANDLERS.0.get();
+            handlers[irq as usize] = Some(handler);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn irq_dispatcher(irq: u8) {
+    let handler = unsafe { (*IRQ_HANDLERS.0.get())[irq as usize] };
+    if let Some(h) = handler {
+        h(irq);
+    } else {
+        klog!("[IRQ] Unhandled hardware IRQ {}", irq);
+    }
+
+    unsafe {
+        crate::apic::eoi();
     }
 }
 
@@ -270,7 +366,6 @@ pub extern "C" fn exception_dispatcher(frame: &ExceptionFrame) {
     };
 
     if vector == 3 {
-        // Breakpoint (#BP) is non-fatal; report and return
         klog!("\r\n[EXCEPTION] Breakpoint (#BP) trapped successfully");
         klog!("  RIP: {:#018x}  CS: {:#06x}", frame.rip, frame.cs);
         klog!("  RFLAGS: {:#018x}  RSP: {:#018x}", frame.rflags, frame.rsp);
@@ -336,5 +431,23 @@ pub fn test_page_fault() {
     unsafe {
         let ptr = 0xDEAD_BEEF as *const u64;
         let _ = core::ptr::read_volatile(ptr);
+    }
+}
+
+fn com1_test_handler(irq: u8) {
+    klog!("[IRQ] Received hardware interrupt");
+    klog!("  Source: COM1 UART (16550A)");
+    klog!("  IRQ:    {}", irq);
+    klog!("  Vector: {:#04x} (36)", IRQ_BASE_VECTOR + irq);
+
+    let _ = unsafe { platform::inb(platform::COM1_PORT + 2) };
+    unsafe { platform::outb(platform::COM1_PORT + 1, 0x00); }
+}
+
+pub fn test_hardware_irq() {
+    register_irq(4, com1_test_handler);
+    unsafe {
+        crate::apic::unmask_irq(4);
+        platform::outb(platform::COM1_PORT + 1, 0x02);
     }
 }

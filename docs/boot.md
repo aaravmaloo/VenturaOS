@@ -55,3 +55,20 @@ calling convention used by UEFI on all x86_64 systems.
 # Using QEMU with OVMF UEFI firmware
 qemu-system-x86_64 -cdrom ventura.iso -bios /path/to/OVMF.fd -m 256M
 ```
+
+## Expected Boot Output
+
+```
+[BOOT] Ventura kernel starting (x86_64)
+[BOOT] Logging initialized
+[BOOT] Platform: x86_64 / UEFI boot services
+[BOOT] GDT initialized
+[BOOT] TSS initialized
+[BOOT] IDT initialized
+[BOOT] Exception handlers installed
+[BOOT] Local APIC initialized
+[BOOT] I/O APIC initialized
+[BOOT] Hardware IRQ routing enabled
+[BOOT] Kernel initialization complete
+[KERNEL] entering main loop
+```
