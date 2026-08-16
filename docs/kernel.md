@@ -50,6 +50,21 @@ Ventura M3.6 introduces comprehensive memory subsystem hardening, defensive inva
 - **Global Allocator**: Implements `core::alloc::GlobalAlloc` annotated with `#[global_allocator]`, unlocking `extern crate alloc` (`Box`, `Vec`, `String`).
 - **Interrupt Safety**: All allocator mutations run inside `platform::without_interrupts()`.
 
+## Execution Context & Kernel Threads (`src/context.rs` & `src/thread.rs`)
+
+Ventura M4.1 & M4.2 establish kernel execution units and thread abstractions:
+- **`ExecutionContext` (`src/context.rs`)**: Software representation of preserved CPU state (`R15..R12`, `RBX`, `RBP`, `RSP`, `RIP`, `RFLAGS`, `state`, `id`). Enables low-level cooperative context switching via the `switch_context` assembly primitive.
+- **`KernelStack` (`src/context.rs`)**: Dedicated 16 KiB VMM-allocated supervisor stack (`READ + WRITE`) per execution unit with unmapped guard pages.
+- **`KernelThread` (`src/thread.rs`)**: Kernel thread abstraction wrapping thread identity (`id`), name, entry point `fn(usize)`, argument, state (`ThreadState`), context (`ExecutionContext`), and stack (`KernelStack`).
+- **`ThreadState` (`src/thread.rs`)**: Explicit lifecycle state tracking (`Created`, `Ready`, `Running`, `Blocked`, `Terminated`).
+- **`ThreadRegistry` (`src/thread.rs`)**: Thread ownership & lookup registry for tracking active kernel threads.
+- **`switch_to(current, target)` (`src/thread.rs`)**: High-level safe Rust manual context-switch primitive. Validates target context, stack pointer, RIP, and lifecycle state before atomically updating thread states and executing low-level assembly CPU state transition.
+- **Resume Point Integrity**: Verified that context switches resume execution at the exact instruction immediately following `switch_to` rather than restarting thread entry functions.
+- **`Process` (`src/process.rs`)**: Process execution container encapsulating unique Process ID (`PID`), process name, lifecycle state (`ProcessState`), owned threads (`Vec<KernelThread>`), and address space placeholder (`address_space_id = 0` for Shared Kernel Address Space).
+- **Process Invariant Validation (`Process::verify()`)**: Deep validation ensuring thread ownership integrity, thread ID uniqueness within process, matching `process_id` tags, and lifecycle state compatibility.
+- **Same & Cross-Process Context Switching**: Verified thread switching within the same process (`A1 -> A2 -> A1`) and across distinct processes (`A1 [Proc A] -> B1 [Proc B] -> A1 [Proc A]`).
+- **Deterministic Rollback**: Cleanly releases physical frames and virtual regions if stack allocation or context creation fails during thread construction.
+
 ## Global Descriptor Table (GDT) & TSS (`src/gdt.rs`)
 
 Ventura establishes its own flat 64-bit GDT with descriptors configured for modern long mode and standard `SYSCALL`/`SYSRET` compatibility:

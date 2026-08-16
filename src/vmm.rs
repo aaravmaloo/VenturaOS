@@ -353,8 +353,31 @@ pub fn root_pml4_page() -> PhysPage {
     unsafe { *ROOT_PML4_PHYS.0.get() }
 }
 
+pub fn region_count() -> usize {
+    platform::without_interrupts(|| unsafe { (&*VMM_STATE.0.get()).region_count })
+}
+
+pub fn next_dynamic_addr() -> u64 {
+    platform::without_interrupts(|| unsafe { (&*VMM_STATE.0.get()).next_dynamic_addr })
+}
+
+/// Advance the dynamic VA cursor to `new_end` if it is currently behind it.
+/// Call this whenever the heap (or any subsystem) maps pages in the dynamic
+/// VA range without going through `reserve_virtual_region`.
+pub fn advance_dynamic_cursor(new_end: u64) {
+    platform::without_interrupts(|| {
+        let vmm = unsafe { &mut *VMM_STATE.0.get() };
+        if new_end > vmm.next_dynamic_addr {
+            vmm.next_dynamic_addr = new_end;
+        }
+    });
+}
+
 unsafe fn get_or_create_table(entry: &mut PageTableEntry) -> Option<*mut PageTable> {
     if entry.is_present() {
+        if (entry.flags().0 & PageTableFlags::HUGE_PAGE.0) != 0 {
+            return None;
+        }
         let phys = entry.phys_addr();
         Some(phys as *mut PageTable)
     } else {
@@ -394,17 +417,22 @@ pub fn map_page(
 
         let pdpt_ptr = match get_or_create_table(&mut pml4.entries[virt_addr.pml4_index()]) {
             Some(p) => p,
-            None => return Err(MapError::FrameAllocationFailed),
+            None => return Ok(()),
         };
 
         let pd_ptr = match get_or_create_table(&mut (*pdpt_ptr).entries[virt_addr.pdpt_index()]) {
             Some(p) => p,
-            None => return Err(MapError::FrameAllocationFailed),
+            None => return Ok(()),
         };
 
-        let pt_ptr = match get_or_create_table(&mut (*pd_ptr).entries[virt_addr.pd_index()]) {
+        let pd_entry = &mut (*pd_ptr).entries[virt_addr.pd_index()];
+        if pd_entry.is_present() && (pd_entry.flags().0 & PageTableFlags::HUGE_PAGE.0) != 0 {
+            return Ok(());
+        }
+
+        let pt_ptr = match get_or_create_table(pd_entry) {
             Some(p) => p,
-            None => return Err(MapError::FrameAllocationFailed),
+            None => return Ok(()),
         };
 
         let leaf_entry = &mut (*pt_ptr).entries[virt_addr.pt_index()];
@@ -413,6 +441,39 @@ pub fn map_page(
         }
 
         leaf_entry.set(phys_addr.addr(), flags);
+        platform::invlpg(virt_addr.as_u64());
+
+        Ok(())
+    })
+}
+
+pub fn map_2mb_huge_page(
+    root_pml4_phys: PhysPage,
+    virt_addr: VirtAddr,
+    phys_addr: PhysPage,
+    flags: PageTableFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(virt_addr.as_u64()) {
+        return Err(MapError::NonCanonicalAddress);
+    }
+    platform::without_interrupts(|| unsafe {
+        let pml4 = &mut *(root_pml4_phys.addr() as *mut PageTable);
+
+        let pdpt_ptr = match get_or_create_table(&mut pml4.entries[virt_addr.pml4_index()]) {
+            Some(p) => p,
+            None => return Err(MapError::FrameAllocationFailed),
+        };
+
+        let pd_ptr = match get_or_create_table(&mut (*pdpt_ptr).entries[virt_addr.pdpt_index()]) {
+            Some(p) => p,
+            None => return Err(MapError::FrameAllocationFailed),
+        };
+
+        let pd_entry = &mut (*pd_ptr).entries[virt_addr.pd_index()];
+        pd_entry.set(
+            phys_addr.addr() & !(0x1F_FFFFu64),
+            flags | PageTableFlags::HUGE_PAGE,
+        );
         platform::invlpg(virt_addr.as_u64());
 
         Ok(())
@@ -692,13 +753,10 @@ pub fn unmap_region(region: &VirtRegion) -> Result<(), VmmError> {
 
     for i in 0..page_count {
         let virt = VirtAddr::new(region.start.as_u64() + (i as u64) * PAGE_SIZE);
-        match unmap_page(root, virt) {
-            Ok(unmapped_phys) => {
-                if region.owns_physical_pages {
-                    let _ = pmm::free_physical_page(unmapped_phys);
-                }
+        if let Ok(unmapped_phys) = unmap_page(root, virt) {
+            if region.owns_physical_pages {
+                let _ = pmm::free_physical_page(unmapped_phys);
             }
-            Err(_) => return Err(VmmError::PageTableMappingFailed),
         }
     }
 
@@ -786,6 +844,19 @@ pub fn init() {
     }
 
     klog!("  Root PML4       : {:#018x}", root_page.addr());
+
+    // Step 0: Identity-map entire lower 4 GB physical space using 2 MB huge pages
+    klog!("[VM] Step 0: identity-mapping 0..4 GB (2 MB huge pages)...");
+    let mut phys_2mb = 0u64;
+    while phys_2mb < 0x1_0000_0000u64 {
+        let _ = map_2mb_huge_page(
+            root_page,
+            VirtAddr::new(phys_2mb),
+            PhysPage(phys_2mb),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+        phys_2mb += 0x20_0000;
+    }
 
     let map = memory::memory_map();
     klog!("[VM] Step 1: identity-mapping {} UEFI regions...", map.region_count);
@@ -880,7 +951,6 @@ pub fn init() {
     // 4. Switch CR3 to the new Ventura-owned PML4
     unsafe {
         let old_cr3 = platform::read_cr3();
-        crate::logger::disable_uefi_console();
         platform::write_cr3(root_page.addr());
         klog!("  Previous CR3    : {:#018x}", old_cr3);
         klog!("  Ventura CR3     : {:#018x}", root_page.addr());

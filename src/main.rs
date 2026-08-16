@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+pub mod address_space;
 pub mod apic;
 pub mod context;
 pub mod gdt;
@@ -14,6 +15,8 @@ pub mod memory;
 pub mod panic;
 pub mod platform;
 pub mod pmm;
+pub mod process;
+pub mod thread;
 pub mod timer;
 pub mod vmm;
 
@@ -236,7 +239,10 @@ fn initialize_vmm_and_heap() {
     vmm::init();
     heap::init();
     memory::run_self_tests();
+    address_space::run_self_tests();
     context::run_self_tests();
+    thread::run_self_tests();
+    process::run_self_tests();
 }
 
 fn initialize_apic() {

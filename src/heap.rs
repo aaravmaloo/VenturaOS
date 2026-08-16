@@ -222,6 +222,8 @@ fn expand_heap(needed_bytes: usize) -> bool {
     let new_block = new_start as *mut BlockHeader;
     let new_payload = (expand_bytes as usize) - BlockHeader::HEADER_SIZE;
 
+    let mut coalesced = false;
+
     unsafe {
         (*new_block).magic = HEAP_MAGIC;
         (*new_block).is_free = true;
@@ -250,14 +252,21 @@ fn expand_heap(needed_bytes: usize) -> bool {
                     if !(*new_block).next.is_null() {
                         (*(*new_block).next).prev = curr;
                     }
+                    coalesced = true;
                 }
             }
         }
     }
 
     heap.current_end = new_end;
+    vmm::advance_dynamic_cursor(new_end);
     heap.stats.total_bytes += expand_bytes as usize;
-    heap.stats.free_bytes += new_payload;
+    // When coalescing, the new block's header bytes are reclaimed into free payload
+    if coalesced {
+        heap.stats.free_bytes += new_payload + BlockHeader::HEADER_SIZE;
+    } else {
+        heap.stats.free_bytes += new_payload;
+    }
     heap.stats.expansion_count += 1;
 
     true
@@ -289,7 +298,7 @@ pub fn allocate(layout: Layout) -> *mut u8 {
                     // Check if block can be split
                     let remaining = (*curr).size - requested_size;
                     if remaining >= BlockHeader::HEADER_SIZE + MIN_BLOCK_PAYLOAD {
-                        // Split block
+                        // Split block: header overhead comes out of free_bytes
                         let next_block_addr = (curr as *mut u8)
                             .add(BlockHeader::HEADER_SIZE + requested_size)
                             as *mut BlockHeader;
@@ -305,6 +314,9 @@ pub fn allocate(layout: Layout) -> *mut u8 {
                         }
                         (*curr).next = next_block_addr;
                         (*curr).size = requested_size;
+                        // The BlockHeader::HEADER_SIZE bytes consumed by new header come from free pool
+                        heap.stats.free_bytes = heap.stats.free_bytes
+                            .saturating_sub(BlockHeader::HEADER_SIZE);
                     }
 
                     (*curr).is_free = false;
@@ -343,6 +355,8 @@ pub fn allocate(layout: Layout) -> *mut u8 {
                             }
                             (*retry_curr).next = next_block_addr;
                             (*retry_curr).size = requested_size;
+                            heap.stats.free_bytes = heap.stats.free_bytes
+                                .saturating_sub(BlockHeader::HEADER_SIZE);
                         }
 
                         (*retry_curr).is_free = false;
@@ -396,6 +410,8 @@ pub fn deallocate(ptr: *mut u8, layout: Layout) {
             // 1. Coalesce with next block if free
             if !(*header).next.is_null() && (*(*header).next).is_free {
                 let next = (*header).next;
+                // Absorb next block's header back into free_bytes
+                heap.stats.free_bytes += BlockHeader::HEADER_SIZE;
                 (*header).size += BlockHeader::HEADER_SIZE + (*next).size;
                 (*header).next = (*next).next;
                 if !(*next).next.is_null() {
@@ -406,6 +422,8 @@ pub fn deallocate(ptr: *mut u8, layout: Layout) {
             // 2. Coalesce with prev block if free
             if !(*header).prev.is_null() && (*(*header).prev).is_free {
                 let prev = (*header).prev;
+                // Absorb current block's header back into free_bytes
+                heap.stats.free_bytes += BlockHeader::HEADER_SIZE;
                 (*prev).size += BlockHeader::HEADER_SIZE + (*header).size;
                 (*prev).next = (*header).next;
                 if !(*header).next.is_null() {

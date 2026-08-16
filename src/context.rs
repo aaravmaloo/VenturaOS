@@ -111,26 +111,45 @@ pub fn create_context_raw(
         return Err(ContextError::InvalidStackPointer);
     }
 
-    // System V x86_64 ABI: RSP must be 16-byte aligned before call
-    let aligned_sp = (stack_top & !0xFu64) - 16;
     let id = NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-    // Push entry_addr and id onto the initial stack for initial_context_entry
+    // Initial stack frame layout (80 bytes total, 16-byte aligned):
+    // [stack_top - 8]  = initial_context_entry (popped by ret)
+    // [stack_top - 16] = 0x202 (popped by popfq)
+    // [stack_top - 24] = 0 (rbx)
+    // [stack_top - 32] = 0 (rbp)
+    // [stack_top - 40] = entry_addr (r12)
+    // [stack_top - 48] = id (r13)
+    // [stack_top - 56] = 0 (r14)
+    // [stack_top - 64] = 0 (r15)
+    // [stack_top - 72] = 0 (rdi)
+    // [stack_top - 80] = 0 (rsi)
+    let initial_sp = (stack_top & !0xFu64) - 80;
+
     unsafe {
-        (aligned_sp as *mut u64).write(entry_addr);
-        ((aligned_sp + 8) as *mut u64).write(id);
+        let p = initial_sp as *mut u64;
+        p.add(0).write(0);                                         // rsi
+        p.add(1).write(0);                                         // rdi
+        p.add(2).write(0);                                         // r15
+        p.add(3).write(0);                                         // r14
+        p.add(4).write(id);                                        // r13
+        p.add(5).write(entry_addr);                               // r12
+        p.add(6).write(0);                                         // rbp
+        p.add(7).write(0);                                         // rbx
+        p.add(8).write(0x202);                                     // rflags
+        p.add(9).write(initial_context_entry as *const () as u64); // return address for ret
     }
 
     Ok(ExecutionContext {
-        rsp: aligned_sp,
+        rsp: initial_sp,
         r15: 0,
         r14: 0,
-        r13: 0,
-        r12: 0,
+        r13: id,
+        r12: entry_addr,
         rbx: 0,
         rbp: 0,
         rip: initial_context_entry as *const () as u64,
-        rflags: 0x202, // IF (bit 9) enabled, reserved bit 1 set
+        rflags: 0x202,
         state: ContextState::Initialized,
         id,
     })
@@ -146,8 +165,11 @@ pub fn create_context(
 #[no_mangle]
 pub unsafe extern "C" fn initial_context_entry() -> ! {
     asm!(
-        "pop rdi", // entry_point
-        "pop rsi", // context_id
+        // r12 holds entry_point, r13 holds context_id (restored by switch_context)
+        "mov rcx, r12", // 1st arg for x86_64 Win64 ABI
+        "mov rdx, r13", // 2nd arg for x86_64 Win64 ABI
+        // 32-byte shadow space required by x86_64 Win64 ABI
+        "sub rsp, 32",
         "call kernel_context_trampoline",
         options(noreturn)
     );
@@ -158,9 +180,6 @@ pub extern "C" fn kernel_context_trampoline(entry_raw: u64, id: u64) -> ! {
     let entry_fn: fn() = unsafe { core::mem::transmute(entry_raw) };
 
     klog!("[CONTEXT {}] Context started via trampoline (RIP={:#018x})", id, entry_raw);
-
-    // Enable interrupts for this context
-    platform::sti();
 
     // Execute kernel function
     entry_fn();
@@ -182,52 +201,48 @@ pub unsafe extern "C" fn switch_context(
     next: *const ExecutionContext,
 ) {
     asm!(
-        // 1. Save current callee-saved registers to prev context
-        "mov [rdi + 8], r15",
-        "mov [rdi + 16], r14",
-        "mov [rdi + 24], r13",
-        "mov [rdi + 32], r12",
-        "mov [rdi + 40], rbx",
-        "mov [rdi + 48], rbp",
-
-        // Save RSP
-        "mov [rdi + 0], rsp",
-
-        // Save return address from stack into prev.rip
-        "mov rax, [rsp]",
-        "mov [rdi + 56], rax",
-
-        // Save RFLAGS into prev.rflags
+        // 1. Save RFLAGS
         "pushfq",
-        "pop rax",
-        "mov [rdi + 64], rax",
+
+        // 2. Save all callee-saved registers onto current stack
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "push rdi",
+        "push rsi",
+
+        // 3. Save current RSP to prev context struct
+        "mov [rcx], rsp",
 
         // Update prev state to Suspended
-        "mov byte ptr [rdi + 72], 4", // ContextState::Suspended
+        "mov byte ptr [rcx + 72], 4", // ContextState::Suspended
 
         // Update next state to Running
-        "mov byte ptr [rsi + 72], 3", // ContextState::Running
+        "mov byte ptr [rdx + 72], 3", // ContextState::Running
 
-        // 2. Switch to next stack pointer
-        "mov rsp, [rsi + 0]",
+        // 4. Switch to next stack pointer
+        "mov rsp, [rdx]",
 
-        // Restore RFLAGS from next.rflags
-        "mov rax, [rsi + 64]",
-        "push rax",
+        // 5. Restore callee-saved registers from new stack
+        "pop rsi",
+        "pop rdi",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+
+        // 6. Restore RFLAGS
         "popfq",
 
-        // Restore callee-saved registers from next context
-        "mov r15, [rsi + 8]",
-        "mov r14, [rsi + 16]",
-        "mov r13, [rsi + 24]",
-        "mov r12, [rsi + 32]",
-        "mov rbx, [rsi + 40]",
-        "mov rbp, [rsi + 48]",
-
-        // Jump to next.rip
-        "jmp qword ptr [rsi + 56]",
-        in("rdi") prev,
-        in("rsi") next,
+        // 7. Return to caller on the new stack
+        "ret",
+        in("rcx") prev,
+        in("rdx") next,
         options(noreturn)
     );
 }
@@ -290,8 +305,12 @@ pub fn run_self_tests() {
     // 1. Validation tests
     let dummy_stack = match KernelStack::allocate() {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            let region_count = vmm::region_count();
             klog!("[CONTEXT TEST FAILED] Failed to allocate dummy stack!");
+            klog!("  Error       : {:?}", e);
+            klog!("  VMM regions : {}/{}", region_count, vmm::MAX_VIRT_REGIONS);
+            klog!("  Next VA     : {:#018x}", vmm::next_dynamic_addr());
             platform::halt();
         }
     };
