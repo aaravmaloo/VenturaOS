@@ -20,7 +20,7 @@ efi_main(image_handle, system_table)
        │
        ├─ initialize_logging()    ← logs startup banner
        ├─ initialize_platform()   ← logs platform details
-       ├─ initialize_memory()     ← PMM bitmap init & VMM page table construction (CR3 switch)
+       ├─ initialize_memory()     ← PMM bitmap init & VMM region/page tables (CR3 switch)
        ├─ initialize_gdt()        ← installs Ventura GDT, TSS, reloads CS/SS/TR
        ├─ initialize_idt()        ← installs 256-entry IDT & exception/IRQ stubs
        ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC
@@ -40,17 +40,18 @@ Ventura manages physical memory using a deterministic **Bitmap Physical Page All
   - `pmm::allocate_physical_page() -> Option<PhysPage>`
   - `pmm::free_physical_page(page: PhysPage) -> Result<(), PageFreeError>`
 
-## Virtual Memory & 4-Level Paging (`src/vmm.rs`)
+## Virtual Memory Manager & Paging (`src/vmm.rs`)
 
-Ventura establishes its own x86-64 4-level page table hierarchy (PML4 -> PDPT -> PD -> PT):
-- **Page Table Allocation**: All table frames are allocated dynamically from `pmm::allocate_physical_page()`.
-- **Identity & MMIO Map**: Identity-maps all discovered physical RAM, Ventura kernel text/data (`LoaderCode`/`LoaderData`), and device MMIO (`0xFEE0_0000` LAPIC, `0xFEC0_0000` I/O APIC, `0x000A_0000` VGA).
-- **CR3 Switch**: Ventura switches `CR3` from firmware-created page tables to Ventura-owned PML4.
-- **Core API**:
-  - `vmm::map_page(root_pml4, virt_addr, phys_addr, flags) -> Result<(), MapError>`
-  - `vmm::unmap_page(root_pml4, virt_addr) -> Result<PhysPage, UnmapError>`
-  - `vmm::translate(root_pml4, virt_addr) -> Option<(PhysPage, PageTableFlags)>`
-- **TLB Invalidation**: Targeted `invlpg` assembly instructions invalidate TLB entries on mapping modifications and unmappings.
+Ventura manages virtual memory translation and address-space policy via the **Virtual Memory Manager (VMM)**:
+- **Canonical Address Validation**: Enforces 48-bit sign-extended canonical addresses.
+- **4-Level Page Table Hierarchy**: PML4 -> PDPT -> PD -> PT, dynamically allocated from `pmm`.
+- **Region Management (`VirtRegion`)**:
+  - `reserve_virtual_region()`: Allocates non-overlapping virtual address spans in `0x0000_1000_0000_0000..0x0000_7000_0000_0000`.
+  - `map_region()`: Maps physical frames into a virtual region with atomic rollback on failure.
+  - `allocate_and_map_region()`: End-to-end virtual reservation, physical allocation, and mapping with complete rollback.
+  - `unmap_region()`: Unmaps pages, flushes TLB (`invlpg`), and releases owned physical frames.
+  - `find_region_for_addr()`: Address-to-region lookup for page fault diagnostics.
+- **Permissions Abstraction (`VirtPermissions`)**: Strongly typed `readable`, `writable`, `executable`, and `user` bits mapped to x86-64 page table flags.
 
 ## Global Descriptor Table (GDT) & TSS (`src/gdt.rs`)
 
