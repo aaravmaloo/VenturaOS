@@ -116,9 +116,34 @@ pub unsafe fn read_cr3() -> u64 {
     cr3
 }
 
-#[inline(always)]
+#[inline(never)]
 pub unsafe fn write_cr3(val: u64) {
-    asm!("mov cr3, {}", in(reg) val, options(nomem, nostack, preserves_flags));
+    // NOTE: Do NOT use `nomem` or `preserves_flags` here.
+    // Writing CR3 changes the TLB/page-table context for ALL subsequent memory
+    // accesses.  Lying to LLVM with `nomem` would allow it to reorder any load
+    // or store across this instruction, which is undefined behaviour.
+    // `inline(never)` gives an extra serialisation barrier at the call boundary.
+    asm!(
+        "mov cr3, {}",
+        in(reg) val,
+        options(nostack),   // no nomem, no preserves_flags
+    );
+}
+
+/// Enable the NXE (No-Execute Enable) bit in the EFER MSR.
+///
+/// This MUST be called before any page table entry with bit 63 (NO_EXECUTE)
+/// is live.  Without NXE=1 the CPU treats bit 63 as a reserved bit and raises
+/// a #PF(RSVD) on the very first page-table walk of such an entry, causing an
+/// immediate triple fault after CR3 is switched.
+#[inline(always)]
+pub unsafe fn enable_nxe() {
+    const IA32_EFER: u32 = 0xC000_0080;
+    const NXE_BIT: u64   = 1 << 11;
+    let current = rdmsr(IA32_EFER);
+    if current & NXE_BIT == 0 {
+        wrmsr(IA32_EFER, current | NXE_BIT);
+    }
 }
 
 #[inline(always)]

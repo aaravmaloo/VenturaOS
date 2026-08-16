@@ -462,6 +462,8 @@ const EXCEPTION_NAMES: [&str; 32] = [
 
 #[no_mangle]
 pub extern "sysv64" fn exception_dispatcher(frame: &ExceptionFrame) {
+    platform::cli();
+
     let vector = frame.vector as usize;
     let name = if vector < EXCEPTION_NAMES.len() {
         EXCEPTION_NAMES[vector]
@@ -502,7 +504,10 @@ pub extern "sysv64" fn exception_dispatcher(frame: &ExceptionFrame) {
     }
 
     klog!("[CPU EXCEPTION] Halting CPU safely.\r\n");
-    platform::halt();
+    loop {
+        platform::cli();
+        platform::hlt();
+    }
 }
 
 pub fn test_breakpoint() {

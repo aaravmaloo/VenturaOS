@@ -83,6 +83,13 @@ qemu-system-x86_64 -cdrom ventura.iso -bios /path/to/OVMF.fd -m 256M
 [VM] CR3 switched to Ventura page tables successfully
 [VM] Testing Virtual Memory Manager (VMM)...
 [VM] Virtual Memory Manager self-tests passed successfully
+[HEAP] Initializing kernel dynamic heap...
+  Heap Virtual Start : 0x0000200000000000
+  Heap Virtual End   : 0x0000200000020000
+  Initial Capacity   : 128 KiB (32 pages)
+[HEAP] Kernel heap ready
+[HEAP] Testing kernel heap allocator...
+[HEAP] Kernel heap self-tests passed successfully
 [BOOT] GDT initialized
 [BOOT] TSS initialized
 [BOOT] IDT initialized

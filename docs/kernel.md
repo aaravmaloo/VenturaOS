@@ -20,7 +20,7 @@ efi_main(image_handle, system_table)
        │
        ├─ initialize_logging()    ← logs startup banner
        ├─ initialize_platform()   ← logs platform details
-       ├─ initialize_memory()     ← PMM bitmap init & VMM region/page tables (CR3 switch)
+       ├─ initialize_memory()     ← PMM init -> VMM init (CR3 switch) -> Kernel Heap init
        ├─ initialize_gdt()        ← installs Ventura GDT, TSS, reloads CS/SS/TR
        ├─ initialize_idt()        ← installs 256-entry IDT & exception/IRQ stubs
        ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC
@@ -52,6 +52,14 @@ Ventura manages virtual memory translation and address-space policy via the **Vi
   - `unmap_region()`: Unmaps pages, flushes TLB (`invlpg`), and releases owned physical frames.
   - `find_region_for_addr()`: Address-to-region lookup for page fault diagnostics.
 - **Permissions Abstraction (`VirtPermissions`)**: Strongly typed `readable`, `writable`, `executable`, and `user` bits mapped to x86-64 page table flags.
+
+## Kernel Dynamic Heap & Global Allocator (`src/heap.rs`)
+
+Ventura implements a first-fit linked-list kernel heap with block splitting, coalescing, and dynamic expansion:
+- **Virtual Location**: Starts at `0x0000_2000_0000_0000`, expandable on demand via VMM + PMM.
+- **Safety Header**: 32-byte 16-aligned header containing `0x5645_4E54` (`VENT`) magic, size, and bidirectional pointers.
+- **Global Allocator**: Implements `core::alloc::GlobalAlloc` annotated with `#[global_allocator]`, unlocking `extern crate alloc` (`Box`, `Vec`, `String`).
+- **Interrupt Safety**: All allocator mutations run inside `platform::without_interrupts()`.
 
 ## Global Descriptor Table (GDT) & TSS (`src/gdt.rs`)
 

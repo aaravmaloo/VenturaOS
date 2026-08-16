@@ -6,12 +6,21 @@ use crate::pmm::{self, PhysPage};
 
 pub const DYNAMIC_VIRT_START: u64 = 0x0000_1000_0000_0000;
 pub const DYNAMIC_VIRT_END: u64   = 0x0000_7000_0000_0000;
-pub const MAX_VIRT_REGIONS: usize = 64;
+pub const MAX_VIRT_REGIONS: usize = 256;
 
 #[inline(always)]
 pub fn is_canonical(addr: u64) -> bool {
     let sign_ext = ((addr as i64) >> 47) as i64;
     sign_ext == 0 || sign_ext == -1
+}
+
+#[inline(always)]
+pub fn canonical_virt(phys: u64) -> VirtAddr {
+    if (phys & (1 << 47)) != 0 {
+        VirtAddr(phys | 0xFFFF_0000_0000_0000)
+    } else {
+        VirtAddr(phys & 0x0000_FFFF_FFFF_FFFF)
+    }
 }
 
 #[repr(transparent)]
@@ -114,7 +123,7 @@ impl PageTableFlags {
     pub const GLOBAL: Self          = Self(1 << 8);
     pub const NO_EXECUTE: Self      = Self(1 << 63);
 
-    pub const KERNEL_CODE: Self = Self(Self::PRESENT.0);
+    pub const KERNEL_CODE: Self = Self(Self::PRESENT.0 | Self::WRITABLE.0);
     pub const KERNEL_DATA: Self = Self(Self::PRESENT.0 | Self::WRITABLE.0 | Self::NO_EXECUTE.0);
     pub const MMIO: Self        = Self(Self::PRESENT.0 | Self::WRITABLE.0 | Self::NO_CACHE.0 | Self::WRITE_THROUGH.0 | Self::NO_EXECUTE.0);
 }
@@ -178,6 +187,7 @@ impl PageTableEntry {
 }
 
 #[repr(C, align(4096))]
+#[derive(Copy, Clone)]
 pub struct PageTable {
     pub entries: [PageTableEntry; 512],
 }
@@ -309,6 +319,33 @@ impl VirtualMemoryManager {
 struct SyncCell<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for SyncCell<T> {}
 
+const BOOTSTRAP_TABLE_COUNT: usize = 512;
+
+#[repr(C, align(4096))]
+pub struct BootstrapTablePool {
+    pub tables: [PageTable; BOOTSTRAP_TABLE_COUNT],
+}
+
+static mut BOOTSTRAP_POOL: BootstrapTablePool = BootstrapTablePool {
+    tables: [PageTable::empty(); BOOTSTRAP_TABLE_COUNT],
+};
+static mut BOOTSTRAP_INDEX: usize = 0;
+static mut IS_BOOTSTRAPPING: bool = true;
+
+fn allocate_bootstrap_table() -> Option<PhysPage> {
+    unsafe {
+        if BOOTSTRAP_INDEX >= BOOTSTRAP_TABLE_COUNT {
+            klog!("[VM ERROR] Bootstrap page table pool exhausted!");
+            return None;
+        }
+        let table_ptr = &mut BOOTSTRAP_POOL.tables[BOOTSTRAP_INDEX] as *mut PageTable;
+        BOOTSTRAP_INDEX += 1;
+        (*table_ptr).zero();
+        let phys_addr = table_ptr as u64;
+        Some(PhysPage(phys_addr))
+    }
+}
+
 static ROOT_PML4_PHYS: SyncCell<PhysPage> = SyncCell(UnsafeCell::new(PhysPage::NULL));
 static VMM_STATE: SyncCell<VirtualMemoryManager> = SyncCell(UnsafeCell::new(VirtualMemoryManager::new()));
 
@@ -321,10 +358,17 @@ unsafe fn get_or_create_table(entry: &mut PageTableEntry) -> Option<*mut PageTab
         let phys = entry.phys_addr();
         Some(phys as *mut PageTable)
     } else {
-        let frame = pmm::allocate_physical_page()?;
+        let frame = if IS_BOOTSTRAPPING {
+            allocate_bootstrap_table()?
+        } else {
+            pmm::allocate_physical_page()?
+        };
         let table_ptr = frame.addr() as *mut PageTable;
         (*table_ptr).zero();
-        entry.set(frame.addr(), PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE);
+        entry.set(
+            frame.addr(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
         Some(table_ptr)
     }
 }
@@ -671,55 +715,70 @@ pub fn find_region_for_addr(addr: VirtAddr) -> Option<VirtRegion> {
 pub fn init() {
     klog!("[VM] Initializing Ventura page tables (4-level x86-64)");
 
-    let root_page = pmm::allocate_physical_page().expect("failed to allocate root PML4");
     unsafe {
-        let root_ptr = root_page.addr() as *mut PageTable;
-        (*root_ptr).zero();
+        IS_BOOTSTRAPPING = true;
+    }
+
+    let root_page = allocate_bootstrap_table().expect("failed to allocate root PML4");
+    unsafe {
         *ROOT_PML4_PHYS.0.get() = root_page;
     }
 
     klog!("  Root PML4       : {:#018x}", root_page.addr());
 
     let map = memory::memory_map();
+    klog!("[VM] Step 1: identity-mapping {} UEFI regions...", map.region_count);
 
     // 1. Identity map all discovered physical memory regions
     for i in 0..map.region_count {
         let r = &map.regions[i];
+
         let (flags, perms, purpose) = match r.region_type {
-            MemoryType::LoaderCode => (
-                PageTableFlags::KERNEL_CODE,
-                VirtPermissions::KERNEL_CODE,
-                RegionPurpose::KernelBinary,
+            MemoryType::Mmio => (
+                PageTableFlags::MMIO,
+                VirtPermissions::MMIO,
+                RegionPurpose::Mmio,
             ),
             _ => (
-                PageTableFlags::KERNEL_DATA,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
                 VirtPermissions::KERNEL_DATA,
                 RegionPurpose::DirectMappedRam,
             ),
         };
 
-        let start_page = r.physical_start;
-        let end_page = r.physical_end;
+        let start_page = r.physical_start & !(PAGE_SIZE - 1);
+        let end_page = (r.physical_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         let mut curr = start_page;
         while curr < end_page {
-            let virt = VirtAddr::new(curr);
+            let virt = canonical_virt(curr);
             let phys = PhysPage(curr);
-            let _ = map_page(root_page, virt, phys, flags);
+            if let Err(e) = map_page(root_page, virt, phys, flags) {
+                if e != MapError::AlreadyMapped {
+                    klog!("  [VM WARN] region {} [{:#x}]: map_page error {:?}", i, curr, e);
+                }
+            }
             curr += PAGE_SIZE;
         }
 
         let region = VirtRegion {
-            start: VirtAddr::new(start_page),
+            start: canonical_virt(start_page),
             size_bytes: end_page - start_page,
             permissions: perms,
             purpose,
             owns_physical_pages: false,
         };
-        let _ = register_region(region);
+        if let Err(e) = register_region(region) {
+            if e != VmmError::RegionOverlaps {
+                klog!("  [VM WARN] region {} register_region error {:?}", i, e);
+            }
+        }
     }
 
+    klog!("[VM] Step 1 done: {} regions identity-mapped", map.region_count);
+
     // 2. Identity map essential hardware MMIO regions
+    klog!("[VM] Step 2: mapping LAPIC / IOAPIC / VGA MMIO...");
     let _ = map_page(root_page, VirtAddr::new(0xFEE0_0000), PhysPage(0xFEE0_0000), PageTableFlags::MMIO);
     let _ = map_page(root_page, VirtAddr::new(0xFEC0_0000), PhysPage(0xFEC0_0000), PageTableFlags::MMIO);
     let mut vga_curr = 0x000A_0000u64;
@@ -750,12 +809,20 @@ pub fn init() {
         owns_physical_pages: false,
     });
 
-    // 3. Switch CR3 to the new Ventura-owned PML4
+    klog!("[VM] Step 2 done: MMIO regions mapped");
+
+    // 3. Enable NXE in EFER *before* switching CR3.
+    klog!("[VM] Step 3: enabling EFER.NXE...");
+    unsafe { platform::enable_nxe(); }
+    klog!("[VM] Step 3 done: NXE enabled");
+
+    // 4. Switch CR3 to the new Ventura-owned PML4
     unsafe {
         let old_cr3 = platform::read_cr3();
         platform::write_cr3(root_page.addr());
         klog!("  Previous CR3    : {:#018x}", old_cr3);
         klog!("  Ventura CR3     : {:#018x}", root_page.addr());
+        IS_BOOTSTRAPPING = false;
     }
 
     klog!("[VM] CR3 switched to Ventura page tables successfully");

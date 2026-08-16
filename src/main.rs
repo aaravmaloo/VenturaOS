@@ -2,8 +2,11 @@
 #![no_main]
 #![allow(private_interfaces)]
 
+extern crate alloc;
+
 pub mod apic;
 pub mod gdt;
+pub mod heap;
 pub mod idt;
 pub mod logger;
 pub mod memory;
@@ -163,16 +166,37 @@ pub extern "efiapi" fn efi_main(
 }
 
 fn kernel_main() -> ! {
+    // Disable interrupts immediately.  UEFI hands control with IF=1.
+    // Until our IDT *and* APIC are fully initialized, any hardware interrupt
+    // would be dispatched to our half-ready IDT, which calls apic::eoi() on
+    // an uninitialized LAPIC and never sends a PIC EOI → infinite IRQ loop →
+    // reboot.  without_interrupts() in pmm/vmm re-enables IF on exit, making
+    // the window between calls unsafe.  A single cli() here keeps IF=0
+    // throughout init; we restore it with sti() only after APIC+timer are up.
+    platform::cli();
+
     klog!("[BOOT] Ventura kernel starting (x86_64)");
 
     initialize_logging();
     initialize_platform();
-    initialize_memory();
+
+    // PMM must come first — it discovers usable physical frames.
+    initialize_pmm();
+
+    // GDT and IDT must be installed BEFORE the CR3 switch so that
+    // Ventura's own exception handlers are live when vmm::init() calls
+    // write_cr3().  Without this, any post-switch fault uses UEFI's IDT
+    // whose handlers access UEFI's now-gone page tables → triple fault.
     initialize_gdt();
     initialize_idt();
+
+    // VMM (page tables + CR3 switch) and heap come after GDT/IDT.
+    initialize_vmm_and_heap();
+
     initialize_apic();
     initialize_timer();
 
+    // Everything initialized — safe to enable interrupts now.
     platform::sti();
 
     klog!("[BOOT] Kernel initialization complete");
@@ -189,12 +213,10 @@ fn initialize_platform() {
     klog!("[BOOT] Platform: x86_64 / UEFI boot services");
 }
 
-fn initialize_memory() {
+fn initialize_pmm() {
     memory::log_diagnostics();
     pmm::init();
     pmm::test_allocator();
-    vmm::init();
-    vmm::test_vmm();
 }
 
 fn initialize_gdt() {
@@ -207,6 +229,13 @@ fn initialize_idt() {
     idt::init();
     klog!("[BOOT] IDT initialized");
     klog!("[BOOT] Exception handlers installed");
+}
+
+fn initialize_vmm_and_heap() {
+    vmm::init();
+    vmm::test_vmm();
+    heap::init();
+    heap::test_heap();
 }
 
 fn initialize_apic() {
