@@ -661,12 +661,29 @@ pub fn allocate_and_map_region(
             for j in 0..success_alloc_count {
                 let _ = pmm::free_physical_page(allocated_pages[j]);
             }
+            // Unregister virtual region to prevent region leaks
+            let _ = unregister_region(region.start);
             return Err(VmmError::PageTableMappingFailed);
         }
         success_map_count += 1;
     }
 
     Ok(region)
+}
+
+pub fn unregister_region(start: VirtAddr) -> Result<(), VmmError> {
+    platform::without_interrupts(|| {
+        let vmm = unsafe { &mut *VMM_STATE.0.get() };
+        for i in 0..vmm.region_count {
+            if vmm.regions[i].start == start {
+                vmm.regions[i] = vmm.regions[vmm.region_count - 1];
+                vmm.regions[vmm.region_count - 1] = VirtRegion::empty();
+                vmm.region_count -= 1;
+                return Ok(());
+            }
+        }
+        Err(VmmError::RegionOverlaps)
+    })
 }
 
 pub fn unmap_region(region: &VirtRegion) -> Result<(), VmmError> {
@@ -685,19 +702,7 @@ pub fn unmap_region(region: &VirtRegion) -> Result<(), VmmError> {
         }
     }
 
-    platform::without_interrupts(|| {
-        let vmm = unsafe { &mut *VMM_STATE.0.get() };
-        for i in 0..vmm.region_count {
-            if vmm.regions[i].start == region.start {
-                vmm.regions[i] = vmm.regions[vmm.region_count - 1];
-                vmm.regions[vmm.region_count - 1] = VirtRegion::empty();
-                vmm.region_count -= 1;
-                break;
-            }
-        }
-    });
-
-    Ok(())
+    unregister_region(region.start)
 }
 
 pub fn find_region_for_addr(addr: VirtAddr) -> Option<VirtRegion> {
@@ -710,6 +715,62 @@ pub fn find_region_for_addr(addr: VirtAddr) -> Option<VirtRegion> {
         }
         None
     })
+}
+
+pub fn verify_page_tables() -> Result<(), &'static str> {
+    let root = root_pml4_page();
+    if root == PhysPage::NULL {
+        return Err("VMM Root PML4 is NULL");
+    }
+
+    platform::without_interrupts(|| unsafe {
+        let pml4 = &*(root.addr() as *const PageTable);
+
+        for pml4_e in pml4.entries.iter() {
+            if pml4_e.is_present() {
+                let pdpt_phys = pml4_e.phys_addr();
+                if pdpt_phys % PAGE_SIZE != 0 {
+                    return Err("PML4 entry physical address is unaligned");
+                }
+
+                let pdpt = &*(pdpt_phys as *const PageTable);
+                for pdpt_e in pdpt.entries.iter() {
+                    if pdpt_e.is_present() {
+                        let pd_phys = pdpt_e.phys_addr();
+                        if pd_phys % PAGE_SIZE != 0 {
+                            return Err("PDPT entry physical address is unaligned");
+                        }
+
+                        let pd = &*(pd_phys as *const PageTable);
+                        for pd_e in pd.entries.iter() {
+                            if pd_e.is_present() {
+                                let pt_phys = pd_e.phys_addr();
+                                if pt_phys % PAGE_SIZE != 0 {
+                                    return Err("PD entry physical address is unaligned");
+                                }
+
+                                let pt = &*(pt_phys as *const PageTable);
+                                for pt_e in pt.entries.iter() {
+                                    if pt_e.is_present() {
+                                        let leaf_phys = pt_e.phys_addr();
+                                        if leaf_phys % PAGE_SIZE != 0 {
+                                            return Err("PT leaf entry physical address is unaligned");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn verify_null_page_unmapped() -> bool {
+    let root = root_pml4_page();
+    translate(root, VirtAddr::new(0)).is_none()
 }
 
 pub fn init() {
@@ -819,6 +880,7 @@ pub fn init() {
     // 4. Switch CR3 to the new Ventura-owned PML4
     unsafe {
         let old_cr3 = platform::read_cr3();
+        crate::logger::disable_uefi_console();
         platform::write_cr3(root_page.addr());
         klog!("  Previous CR3    : {:#018x}", old_cr3);
         klog!("  Ventura CR3     : {:#018x}", root_page.addr());
@@ -829,9 +891,25 @@ pub fn init() {
 }
 
 pub fn test_vmm() {
-    klog!("[VM] Testing Virtual Memory Manager (VMM)...");
+    test_vmm_hardened();
+}
 
-    // 1. Test canonical address validation
+pub fn test_vmm_hardened() {
+    klog!("[VM] Running Virtual Memory Manager self-tests...");
+
+    // 1. Verify Page Table Consistency
+    if let Err(msg) = verify_page_tables() {
+        klog!("[VM TEST FAILED] Page table verification error: {}", msg);
+        platform::halt();
+    }
+
+    // 2. Verify NULL Page Protection
+    if !verify_null_page_unmapped() {
+        klog!("[VM TEST FAILED] Virtual address 0 (NULL page) is mapped!");
+        platform::halt();
+    }
+
+    // 3. Test canonical address validation
     if is_canonical(0xDEAD_0000_0000_0000) {
         klog!("[VM TEST FAILED] Non-canonical address returned true!");
         platform::halt();
@@ -841,7 +919,10 @@ pub fn test_vmm() {
         platform::halt();
     }
 
-    // 2. Test dynamic region reservation
+    // Record region count before allocation for leak detection
+    let initial_region_count = platform::without_interrupts(|| unsafe { (&*VMM_STATE.0.get()).region_count });
+
+    // 4. Test dynamic region reservation
     let region = match reserve_virtual_region(
         PAGE_SIZE * 4,
         VirtPermissions::KERNEL_DATA,
@@ -859,7 +940,7 @@ pub fn test_vmm() {
         platform::halt();
     }
 
-    // 3. Test allocate_and_map_region (with 2 pages)
+    // 5. Test allocate_and_map_region (with 2 pages)
     let dyn_region = match allocate_and_map_region(
         PAGE_SIZE * 2,
         VirtPermissions::KERNEL_DATA,
@@ -872,7 +953,7 @@ pub fn test_vmm() {
         }
     };
 
-    // 4. Test live write/read through the dynamically allocated virtual region
+    // 6. Test live write/read through the dynamically allocated virtual region
     unsafe {
         let ptr1 = dyn_region.start.as_mut_ptr::<u64>();
         let ptr2 = (dyn_region.start.as_u64() + PAGE_SIZE) as *mut u64;
@@ -886,21 +967,21 @@ pub fn test_vmm() {
         }
     }
 
-    // 5. Test find_region_for_addr
+    // 7. Test find_region_for_addr
     let found = find_region_for_addr(dyn_region.start);
     if found.is_none() {
         klog!("[VM TEST FAILED] find_region_for_addr failed to find active region!");
         platform::halt();
     }
 
-    // 6. Test unmap_region
+    // 8. Test unmap_region
     let unmap_res = unmap_region(&dyn_region);
     if unmap_res.is_err() {
         klog!("[VM TEST FAILED] unmap_region returned error!");
         platform::halt();
     }
 
-    // 7. Verify address is now unmapped
+    // 9. Verify address is now unmapped
     let root = root_pml4_page();
     if translate(root, dyn_region.start).is_some() {
         klog!("[VM TEST FAILED] Address still mapped after unmap_region!");
@@ -909,5 +990,12 @@ pub fn test_vmm() {
 
     let _ = unmap_region(&region);
 
-    klog!("[VM] Virtual Memory Manager self-tests passed successfully");
+    // 10. Verify region leak check
+    let final_region_count = platform::without_interrupts(|| unsafe { (&*VMM_STATE.0.get()).region_count });
+    if initial_region_count != final_region_count {
+        klog!("[VM TEST FAILED] Region count leak detected! before={}, after={}", initial_region_count, final_region_count);
+        platform::halt();
+    }
+
+    klog!("[VM] Region validation & translation tests: PASS");
 }

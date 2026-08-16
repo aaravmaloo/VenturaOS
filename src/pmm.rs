@@ -203,13 +203,68 @@ pub fn free_physical_page(page: PhysPage) -> Result<(), PageFreeError> {
     })
 }
 
-pub fn test_allocator() {
-    klog!("[MEM] Testing physical page allocator...");
+pub fn verify_invariants() -> Result<(), &'static str> {
+    platform::without_interrupts(|| {
+        let stats = unsafe { &*STATS.0.get() };
+        let bitmap = unsafe { &*BITMAP.0.get() };
 
+        // 1. Invariant: total = usable + reserved (or used + free == total)
+        if stats.used_pages + stats.free_pages != stats.total_managed_pages {
+            return Err("PMM invariant failure: used_pages + free_pages != total_managed_pages");
+        }
+
+        // 2. Invariant: Page 0 (IVT/BDA) must remain reserved (bit 0 set)
+        if (bitmap[0] & 1) == 0 {
+            return Err("PMM invariant failure: Page 0 is marked FREE");
+        }
+
+        // 3. Invariant: Scan bitmap and verify total free bits match stats.free_pages
+        let mut actual_free = 0usize;
+        let words_to_scan = (stats.total_managed_pages + 63) / 64;
+
+        for w in 0..words_to_scan {
+            let word = bitmap[w];
+            let free_bits = (!word).count_ones() as usize;
+
+            // Handle trailing bits in last word
+            if w == words_to_scan - 1 && stats.total_managed_pages % 64 != 0 {
+                let valid_bits = stats.total_managed_pages % 64;
+                let mask = (1u64 << valid_bits) - 1;
+                let valid_word = word | !mask;
+                actual_free += (!valid_word).count_ones() as usize;
+            } else {
+                actual_free += free_bits;
+            }
+        }
+
+        if actual_free != stats.free_pages {
+            return Err("PMM invariant failure: bitmap free bit count mismatch with stats.free_pages");
+        }
+
+        Ok(())
+    })
+}
+
+pub fn test_allocator() {
+    test_pmm_hardened();
+}
+
+pub fn test_pmm_hardened() {
+    klog!("[PMM] Running physical memory allocator self-tests...");
+
+    // 1. Verify invariants before test
+    if let Err(msg) = verify_invariants() {
+        klog!("[PMM TEST FAILED] Invariant check failed before test: {}", msg);
+        platform::halt();
+    }
+
+    let initial_free = stats().free_pages;
+
+    // 2. Test basic allocation & alignment
     let page1 = match allocate_physical_page() {
         Some(p) => p,
         None => {
-            klog!("[MEM TEST FAILED] Allocation failed on empty pool");
+            klog!("[PMM TEST FAILED] Allocation failed on available pool");
             platform::halt();
         }
     };
@@ -217,59 +272,85 @@ pub fn test_allocator() {
     let page2 = match allocate_physical_page() {
         Some(p) => p,
         None => {
-            klog!("[MEM TEST FAILED] Second allocation failed");
+            klog!("[PMM TEST FAILED] Second allocation failed");
             platform::halt();
         }
     };
 
     if page1 == page2 {
-        klog!("[MEM TEST FAILED] Allocated identical pages!");
+        klog!("[PMM TEST FAILED] Allocated identical physical pages!");
         platform::halt();
     }
 
     if page1.addr() % PAGE_SIZE != 0 || page2.addr() % PAGE_SIZE != 0 {
-        klog!("[MEM TEST FAILED] Unaligned allocation address!");
+        klog!("[PMM TEST FAILED] Unaligned physical allocation address!");
         platform::halt();
     }
 
-    // Free page1 and allocate again: verify first-fit deterministic reuse
-    if let Err(_) = free_physical_page(page1) {
-        klog!("[MEM TEST FAILED] Freeing valid page failed");
+    // 3. Test deterministic first-fit reuse
+    if let Err(e) = free_physical_page(page1) {
+        klog!("[PMM TEST FAILED] Freeing valid page failed: {:?}", e);
         platform::halt();
     }
 
     let page3 = match allocate_physical_page() {
         Some(p) => p,
         None => {
-            klog!("[MEM TEST FAILED] Re-allocation failed");
+            klog!("[PMM TEST FAILED] Re-allocation failed");
             platform::halt();
         }
     };
 
     if page3 != page1 {
-        klog!("[MEM TEST FAILED] First-fit reuse expected same page");
+        klog!("[PMM TEST FAILED] First-fit reuse expected same page!");
         platform::halt();
     }
 
-    // Clean up
+    // Clean up test pages
     let _ = free_physical_page(page2);
     let _ = free_physical_page(page3);
 
-    // Double free detection test
+    // 4. Test error handling
     if let Err(PageFreeError::DoubleFree) = free_physical_page(page3) {
-        // Correct!
+        // Correct! Double free rejected.
     } else {
-        klog!("[MEM TEST FAILED] Double free was not detected!");
+        klog!("[PMM TEST FAILED] Double-free was not rejected!");
         platform::halt();
     }
 
-    // Reserved page 0 free test
     if let Err(PageFreeError::ReservedMemory) = free_physical_page(PhysPage(0)) {
-        // Correct!
+        // Correct! Reserved page 0 rejection verified.
     } else {
-        klog!("[MEM TEST FAILED] Freeing page 0 was not rejected!");
+        klog!("[PMM TEST FAILED] Freeing reserved page 0 was not rejected!");
         platform::halt();
     }
 
-    klog!("[MEM] Allocator self-tests passed successfully");
+    if let Err(PageFreeError::OutOfBounds) = free_physical_page(PhysPage(0xFFFF_FFFF_FFFF_F000)) {
+        // Correct! Out of bounds rejection verified.
+    } else {
+        klog!("[PMM TEST FAILED] Out of bounds page free was not rejected!");
+        platform::halt();
+    }
+
+    if let Err(PageFreeError::UnalignedAddress) = free_physical_page(PhysPage(0x1001)) {
+        // Correct! Unaligned free rejected.
+    } else {
+        klog!("[PMM TEST FAILED] Unaligned page free was not rejected!");
+        platform::halt();
+    }
+
+    // 5. Verify accounting leak check
+    let final_free = stats().free_pages;
+    if initial_free != final_free {
+        klog!("[PMM TEST FAILED] Memory leak in PMM self-test! before={}, after={}", initial_free, final_free);
+        platform::halt();
+    }
+
+    // 6. Verify invariants after test
+    if let Err(msg) = verify_invariants() {
+        klog!("[PMM TEST FAILED] Invariant check failed after test: {}", msg);
+        platform::halt();
+    }
+
+    klog!("[PMM] Invariants & allocation tests: PASS");
 }

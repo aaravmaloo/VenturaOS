@@ -385,6 +385,9 @@ pub fn deallocate(ptr: *mut u8, layout: Layout) {
                 return;
             }
 
+            // Poison freed block payload with 0xDE (DEAD) pattern to catch UAF
+            core::ptr::write_bytes((*header).payload_ptr(), 0xDE, (*header).size);
+
             (*header).is_free = true;
             heap.stats.allocated_bytes = heap.stats.allocated_bytes.saturating_sub((*header).size);
             heap.stats.free_bytes += (*header).size;
@@ -413,10 +416,80 @@ pub fn deallocate(ptr: *mut u8, layout: Layout) {
     });
 }
 
-pub fn test_heap() {
-    klog!("[HEAP] Testing kernel heap allocator...");
+pub fn verify_invariants() -> Result<(), &'static str> {
+    platform::without_interrupts(|| {
+        let heap = unsafe { &*HEAP_STATE.0.get() };
+        if !heap.initialized {
+            return Err("Heap is not initialized");
+        }
 
-    // 1. Small allocation test
+        let mut curr = heap.head;
+        let mut calculated_total = 0usize;
+        let mut calculated_free = 0usize;
+        let mut calculated_alloc = 0usize;
+
+        while !curr.is_null() {
+            unsafe {
+                if (*curr).magic != HEAP_MAGIC {
+                    return Err("Heap invariant failure: Block header magic corruption");
+                }
+
+                if !(*curr).next.is_null() {
+                    if (*(*curr).next).prev != curr {
+                        return Err("Heap invariant failure: Doubly-linked list pointer mismatch");
+                    }
+                }
+
+                let payload_addr = (*curr).payload_ptr() as usize;
+                if payload_addr % 16 != 0 {
+                    return Err("Heap invariant failure: Payload address unaligned to 16 bytes");
+                }
+
+                let block_bytes = BlockHeader::HEADER_SIZE + (*curr).size;
+                calculated_total += block_bytes;
+
+                if (*curr).is_free {
+                    calculated_free += (*curr).size;
+                } else {
+                    calculated_alloc += (*curr).size;
+                }
+
+                curr = (*curr).next;
+            }
+        }
+
+        if calculated_total != heap.stats.total_bytes {
+            return Err("Heap invariant failure: Calculated total bytes mismatch stats");
+        }
+
+        if calculated_free != heap.stats.free_bytes {
+            return Err("Heap invariant failure: Calculated free bytes mismatch stats");
+        }
+
+        if calculated_alloc != heap.stats.allocated_bytes {
+            return Err("Heap invariant failure: Calculated allocated bytes mismatch stats");
+        }
+
+        Ok(())
+    })
+}
+
+pub fn test_heap() {
+    test_heap_hardened();
+}
+
+pub fn test_heap_hardened() {
+    klog!("[HEAP] Running kernel heap allocator self-tests...");
+
+    // 1. Verify invariants before test
+    if let Err(msg) = verify_invariants() {
+        klog!("[HEAP TEST FAILED] Invariant check failed before test: {}", msg);
+        platform::halt();
+    }
+
+    let initial_alloc_bytes = stats().allocated_bytes;
+
+    // 2. Small allocation test
     let layout1 = Layout::from_size_align(64, 16).unwrap();
     let p1 = allocate(layout1);
     if p1.is_null() {
@@ -431,7 +504,7 @@ pub fn test_heap() {
         }
     }
 
-    // 2. Medium allocation test
+    // 3. Medium allocation test
     let layout2 = Layout::from_size_align(1024, 16).unwrap();
     let p2 = allocate(layout2);
     if p2.is_null() {
@@ -446,9 +519,16 @@ pub fn test_heap() {
         }
     }
 
-    // 3. Free p1 and allocate smaller (tests reuse & splitting)
+    // 4. Free p1 and verify UAF poisoning pattern (0xDE)
     deallocate(p1, layout1);
+    unsafe {
+        if *p1 != 0xDE {
+            klog!("[HEAP TEST FAILED] Freed block payload was not poisoned with 0xDE!");
+            platform::halt();
+        }
+    }
 
+    // 5. Re-allocation & splitting test
     let layout3 = Layout::from_size_align(32, 16).unwrap();
     let p3 = allocate(layout3);
     if p3.is_null() {
@@ -456,16 +536,16 @@ pub fn test_heap() {
         platform::halt();
     }
 
-    // 4. Free p2 & p3 (tests coalescing)
+    // 6. Free p2 & p3 (tests coalescing)
     deallocate(p2, layout2);
     deallocate(p3, layout3);
 
-    // 5. Zero-sized allocation test
+    // 7. Zero-sized allocation test
     let zero_layout = Layout::from_size_align(0, 8).unwrap();
     let p_zero = allocate(zero_layout);
     deallocate(p_zero, zero_layout);
 
-    // 6. Test heap expansion (allocate large block exceeding standard page)
+    // 8. Test heap expansion
     let large_layout = Layout::from_size_align(256 * 1024, 16).unwrap();
     let p_large = allocate(large_layout);
     if p_large.is_null() {
@@ -481,7 +561,7 @@ pub fn test_heap() {
     }
     deallocate(p_large, large_layout);
 
-    // 7. Test Rust alloc abstractions (Box and Vec)
+    // 9. Test Rust alloc abstractions (Box and Vec)
     let boxed = alloc::boxed::Box::new(0x1234_5678_9ABC_DEF0u64);
     if *boxed != 0x1234_5678_9ABC_DEF0u64 {
         klog!("[HEAP TEST FAILED] Box<u64> value mismatch!");
@@ -499,5 +579,26 @@ pub fn test_heap() {
     }
     drop(vec);
 
-    klog!("[HEAP] Kernel heap self-tests passed successfully");
+    let mut s = alloc::string::String::from("VenturaOS Memory Hardening");
+    s.push_str(" M3.6");
+    if s.len() != 31 {
+        klog!("[HEAP TEST FAILED] String manipulation failed!");
+        platform::halt();
+    }
+    drop(s);
+
+    // 10. Verify allocation leak check
+    let final_alloc_bytes = stats().allocated_bytes;
+    if initial_alloc_bytes != final_alloc_bytes {
+        klog!("[HEAP TEST FAILED] Memory leak in Heap self-test! before={}, after={}", initial_alloc_bytes, final_alloc_bytes);
+        platform::halt();
+    }
+
+    // 11. Verify invariants after test
+    if let Err(msg) = verify_invariants() {
+        klog!("[HEAP TEST FAILED] Invariant check failed after test: {}", msg);
+        platform::halt();
+    }
+
+    klog!("[HEAP] Allocation, coalescing & poisoning tests: PASS");
 }

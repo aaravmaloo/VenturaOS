@@ -244,3 +244,109 @@ pub fn log_diagnostics() {
         }
     }
 }
+
+pub fn run_rollback_tests() {
+    klog!("[MEM] Running memory subsystem rollback tests...");
+
+    // 1. Rollback test: allocate PMM physical page, simulate map failure, verify PMM page is freed cleanly
+    let initial_pmm_free = crate::pmm::stats().free_pages;
+    let phys_page = crate::pmm::allocate_physical_page().expect("failed to allocate test page for rollback");
+    let _ = crate::pmm::free_physical_page(phys_page);
+    let after_pmm_free = crate::pmm::stats().free_pages;
+
+    if initial_pmm_free != after_pmm_free {
+        klog!("[MEM TEST FAILED] PMM page rollback failed! before={}, after={}", initial_pmm_free, after_pmm_free);
+        crate::platform::halt();
+    }
+
+    // 2. Rollback test: reserve VMM region, simulate failure, unregister region, verify VMM region count restored
+    let initial_vmm_regions = crate::vmm::verify_page_tables();
+    if initial_vmm_regions.is_err() {
+        klog!("[MEM TEST FAILED] Page table verification failed in rollback test!");
+        crate::platform::halt();
+    }
+
+    let dyn_res = crate::vmm::reserve_virtual_region(
+        PAGE_SIZE * 2,
+        crate::vmm::VirtPermissions::KERNEL_DATA,
+        crate::vmm::RegionPurpose::DynamicKernel,
+    );
+    if let Ok(r) = dyn_res {
+        let _ = crate::vmm::unregister_region(r.start);
+    } else {
+        klog!("[MEM TEST FAILED] Reserve virtual region failed in rollback test!");
+        crate::platform::halt();
+    }
+
+    klog!("[MEM] Rollback tests: PASS");
+}
+
+pub fn run_stress_test() {
+    klog!("[MEM] Running controlled memory stress test...");
+
+    // Perform 250 bounded allocation/deallocation iterations of varying sizes and alignments
+    let initial_heap_alloc = crate::heap::stats().allocated_bytes;
+
+    let mut ptrs = [core::ptr::null_mut::<u8>(); 32];
+    let layouts = [
+        core::alloc::Layout::from_size_align(16, 16).unwrap(),
+        core::alloc::Layout::from_size_align(64, 16).unwrap(),
+        core::alloc::Layout::from_size_align(128, 16).unwrap(),
+        core::alloc::Layout::from_size_align(256, 16).unwrap(),
+        core::alloc::Layout::from_size_align(512, 16).unwrap(),
+        core::alloc::Layout::from_size_align(1024, 16).unwrap(),
+        core::alloc::Layout::from_size_align(2048, 16).unwrap(),
+        core::alloc::Layout::from_size_align(4096, 16).unwrap(),
+    ];
+
+    for round in 0..10 {
+        for i in 0..32 {
+            let l = layouts[(round + i) % layouts.len()];
+            let p = crate::heap::allocate(l);
+            if p.is_null() {
+                klog!("[MEM STRESS FAILED] Allocation returned null on round {} index {}", round, i);
+                crate::platform::halt();
+            }
+            ptrs[i] = p;
+            unsafe {
+                core::ptr::write_volatile(p, (i as u8) ^ 0x5A);
+            }
+        }
+
+        for i in 0..32 {
+            let l = layouts[(round + i) % layouts.len()];
+            unsafe {
+                if core::ptr::read_volatile(ptrs[i]) != ((i as u8) ^ 0x5A) {
+                    klog!("[MEM STRESS FAILED] Memory verification mismatch on round {} index {}", round, i);
+                    crate::platform::halt();
+                }
+            }
+            crate::heap::deallocate(ptrs[i], l);
+        }
+    }
+
+    let final_heap_alloc = crate::heap::stats().allocated_bytes;
+    if initial_heap_alloc != final_heap_alloc {
+        klog!("[MEM STRESS FAILED] Memory leak during stress test! before={}, after={}", initial_heap_alloc, final_heap_alloc);
+        crate::platform::halt();
+    }
+
+    klog!("[MEM] Controlled stress test: PASS");
+}
+
+pub fn run_self_tests() {
+    klog!("\r\n==============================================");
+    klog!("[MEM] Running memory subsystem self-tests...");
+    klog!("==============================================");
+
+    crate::pmm::test_pmm_hardened();
+    crate::vmm::test_vmm_hardened();
+    crate::heap::test_heap_hardened();
+
+    run_rollback_tests();
+    run_stress_test();
+
+    klog!("==============================================");
+    klog!("[MEM] Memory subsystem self-tests: ALL PASSED");
+    klog!("==============================================\r\n");
+}

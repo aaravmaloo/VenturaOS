@@ -463,6 +463,7 @@ const EXCEPTION_NAMES: [&str; 32] = [
 #[no_mangle]
 pub extern "sysv64" fn exception_dispatcher(frame: &ExceptionFrame) {
     platform::cli();
+    crate::logger::disable_uefi_console();
 
     let vector = frame.vector as usize;
     let name = if vector < EXCEPTION_NAMES.len() {

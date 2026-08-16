@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod apic;
+pub mod context;
 pub mod gdt;
 pub mod heap;
 pub mod idt;
@@ -233,9 +234,9 @@ fn initialize_idt() {
 
 fn initialize_vmm_and_heap() {
     vmm::init();
-    vmm::test_vmm();
     heap::init();
-    heap::test_heap();
+    memory::run_self_tests();
+    context::run_self_tests();
 }
 
 fn initialize_apic() {

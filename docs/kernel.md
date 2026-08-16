@@ -30,34 +30,23 @@ efi_main(image_handle, system_table)
        └─ kernel_main_loop()      ← platform::hlt() loop
 ```
 
-## Physical Memory & Page Allocator (`src/memory.rs` & `src/pmm.rs`)
+## Memory Subsystem Hardening & Self-Test Suite (`src/memory.rs`, `src/pmm.rs`, `src/vmm.rs`, `src/heap.rs`)
 
-Ventura manages physical memory using a deterministic **Bitmap Physical Page Allocator**:
-- **Base Page Granularity**: `4096` bytes (`PAGE_SIZE = 4096`).
-- **Strong Type**: `PhysPage(pub u64)` encapsulates 4096-aligned physical addresses.
-- **Safety Invariant**: The bitmap initializes with all bits set to `USED` (`1`). Only validated, conventional RAM outside kernel code, data, BSS, and page 0 is marked `FREE` (`0`).
-- **Core API**:
-  - `pmm::allocate_physical_page() -> Option<PhysPage>`
-  - `pmm::free_physical_page(page: PhysPage) -> Result<(), PageFreeError>`
-
-## Virtual Memory Manager & Paging (`src/vmm.rs`)
-
-Ventura manages virtual memory translation and address-space policy via the **Virtual Memory Manager (VMM)**:
-- **Canonical Address Validation**: Enforces 48-bit sign-extended canonical addresses.
-- **4-Level Page Table Hierarchy**: PML4 -> PDPT -> PD -> PT, dynamically allocated from `pmm`.
-- **Region Management (`VirtRegion`)**:
-  - `reserve_virtual_region()`: Allocates non-overlapping virtual address spans in `0x0000_1000_0000_0000..0x0000_7000_0000_0000`.
-  - `map_region()`: Maps physical frames into a virtual region with atomic rollback on failure.
-  - `allocate_and_map_region()`: End-to-end virtual reservation, physical allocation, and mapping with complete rollback.
-  - `unmap_region()`: Unmaps pages, flushes TLB (`invlpg`), and releases owned physical frames.
-  - `find_region_for_addr()`: Address-to-region lookup for page fault diagnostics.
-- **Permissions Abstraction (`VirtPermissions`)**: Strongly typed `readable`, `writable`, `executable`, and `user` bits mapped to x86-64 page table flags.
-
-## Kernel Dynamic Heap & Global Allocator (`src/heap.rs`)
-
-Ventura implements a first-fit linked-list kernel heap with block splitting, coalescing, and dynamic expansion:
-- **Virtual Location**: Starts at `0x0000_2000_0000_0000`, expandable on demand via VMM + PMM.
-- **Safety Header**: 32-byte 16-aligned header containing `0x5645_4E54` (`VENT`) magic, size, and bidirectional pointers.
+Ventura M3.6 introduces comprehensive memory subsystem hardening, defensive invariant validation, UAF poisoning, and self-tests:
+- **PMM Invariant Checks (`pmm::verify_invariants()`)**: Validates `used_pages + free_pages == total_managed_pages`, verifies Page 0 remains reserved, and checks bitwise bitmap consistency.
+- **PMM Defensive Error Handling**: Rejects double-free, unaligned free, reserved page 0 free, and out-of-bounds page free attempts.
+- **Bootstrap Page Table Pool**: Utilizes a static 2 MiB BSS pool (`BOOTSTRAP_POOL`) for zero-fault page table setup under UEFI identity-mapping.
+- **VMM Page Table Validation (`vmm::verify_page_tables()`)**: Deep walks the 4-level PML4 hierarchy to verify 4KB alignment of all intermediate tables and leaf physical addresses.
+- **NULL Page Protection (`vmm::verify_null_page_unmapped()`)**: Guarantees virtual address `0x0` remains unmapped so null pointer dereferences trigger immediate Page Faults.
+- **Heap Invariant Validation (`heap::verify_invariants()`)**: Checks block header magic (`0x5645_4E54`), bidirectional doubly-linked list integrity (`curr.next.prev == curr`), 16-byte payload alignment, and byte accounting.
+- **UAF Debug Poisoning**: Automatically poisons freed heap payloads with `0xDE` (DEAD pattern) on deallocation.
+- **Consolidated Self-Test Suite (`memory::run_self_tests()`)**:
+  - PMM invariants and deterministic allocation/free tests
+  - VMM region validation, page-table consistency, and null page protection tests
+  - Heap invariants, allocation, splitting, coalescing, dynamic expansion, and UAF poisoning tests
+  - Fail-safe rollback tests (PMM/VMM/Heap partial failure recovery)
+  - Controlled stress test (250 bounded allocation/free iterations of varying sizes and alignments)
+  - Memory leak accounting verification
 - **Global Allocator**: Implements `core::alloc::GlobalAlloc` annotated with `#[global_allocator]`, unlocking `extern crate alloc` (`Box`, `Vec`, `String`).
 - **Interrupt Safety**: All allocator mutations run inside `platform::without_interrupts()`.
 
