@@ -108,3 +108,27 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     let high = (value >> 32) as u32;
     asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack, preserves_flags));
 }
+
+#[inline(always)]
+pub unsafe fn read_cr3() -> u64 {
+    let cr3: u64;
+    asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    cr3
+}
+
+#[inline(always)]
+pub unsafe fn write_cr3(val: u64) {
+    asm!("mov cr3, {}", in(reg) val, options(nomem, nostack, preserves_flags));
+}
+
+#[inline(always)]
+pub unsafe fn read_cr2() -> u64 {
+    let cr2: u64;
+    asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+    cr2
+}
+
+#[inline(always)]
+pub unsafe fn invlpg(vaddr: u64) {
+    asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+}

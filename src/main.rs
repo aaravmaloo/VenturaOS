@@ -11,6 +11,7 @@ pub mod panic;
 pub mod platform;
 pub mod pmm;
 pub mod timer;
+pub mod vmm;
 
 type EfiHandle = *mut u8;
 type EfiStatus = usize;
@@ -192,6 +193,8 @@ fn initialize_memory() {
     memory::log_diagnostics();
     pmm::init();
     pmm::test_allocator();
+    vmm::init();
+    vmm::test_vmm();
 }
 
 fn initialize_gdt() {

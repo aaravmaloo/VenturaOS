@@ -20,7 +20,7 @@ efi_main(image_handle, system_table)
        │
        ├─ initialize_logging()    ← logs startup banner
        ├─ initialize_platform()   ← logs platform details
-       ├─ initialize_memory()     ← logs memory stats & initializes PMM bitmap
+       ├─ initialize_memory()     ← PMM bitmap init & VMM page table construction (CR3 switch)
        ├─ initialize_gdt()        ← installs Ventura GDT, TSS, reloads CS/SS/TR
        ├─ initialize_idt()        ← installs 256-entry IDT & exception/IRQ stubs
        ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC
@@ -39,11 +39,18 @@ Ventura manages physical memory using a deterministic **Bitmap Physical Page All
 - **Core API**:
   - `pmm::allocate_physical_page() -> Option<PhysPage>`
   - `pmm::free_physical_page(page: PhysPage) -> Result<(), PageFreeError>`
-- **Validation & Error Detection**:
-  - Rejects unaligned addresses (`PageFreeError::UnalignedAddress`).
-  - Rejects double frees (`PageFreeError::DoubleFree`).
-  - Rejects reserved/zero page frees (`PageFreeError::ReservedMemory`).
-  - Out-of-bounds protection (`PageFreeError::OutOfBounds`).
+
+## Virtual Memory & 4-Level Paging (`src/vmm.rs`)
+
+Ventura establishes its own x86-64 4-level page table hierarchy (PML4 -> PDPT -> PD -> PT):
+- **Page Table Allocation**: All table frames are allocated dynamically from `pmm::allocate_physical_page()`.
+- **Identity & MMIO Map**: Identity-maps all discovered physical RAM, Ventura kernel text/data (`LoaderCode`/`LoaderData`), and device MMIO (`0xFEE0_0000` LAPIC, `0xFEC0_0000` I/O APIC, `0x000A_0000` VGA).
+- **CR3 Switch**: Ventura switches `CR3` from firmware-created page tables to Ventura-owned PML4.
+- **Core API**:
+  - `vmm::map_page(root_pml4, virt_addr, phys_addr, flags) -> Result<(), MapError>`
+  - `vmm::unmap_page(root_pml4, virt_addr) -> Result<PhysPage, UnmapError>`
+  - `vmm::translate(root_pml4, virt_addr) -> Option<(PhysPage, PageTableFlags)>`
+- **TLB Invalidation**: Targeted `invlpg` assembly instructions invalidate TLB entries on mapping modifications and unmappings.
 
 ## Global Descriptor Table (GDT) & TSS (`src/gdt.rs`)
 
@@ -57,9 +64,6 @@ Ventura establishes its own flat 64-bit GDT with descriptors configured for mode
 | `0x18` (`0x1B`) | 3 | Ring 3 | Data | User Data (Read/Write) |
 | `0x20` (`0x23`) | 4 | Ring 3 | Code | 64-bit User Code (`L=1, D=0`) |
 | `0x28` | 5..6 | Ring 0 | System | 16-byte 64-bit Task State Segment (TSS) |
-
-- **Segment Reload**: `CS` is atomically reloaded using a 64-bit far return (`retfq`), `DS`/`ES`/`SS` are loaded with `0x10`, and the Task Register is loaded using `ltr 0x28`.
-- **TSS**: 104-byte structure providing `RSP0` for future privilege transitions and `IST` pointers for dedicated stack switching.
 
 ## Interrupt Descriptor Table (IDT) & Hardware IRQs (`src/idt.rs` & `src/apic.rs`)
 
@@ -79,7 +83,7 @@ Ventura uses the built-in **Local APIC Timer** running in **Periodic Mode**:
 - **Divider**: Configured via `LAPIC_TIMER_DCR` to Divide by 16 (`0x03`).
 - **Initial Count**: Loaded into `LAPIC_TIMER_ICR` (`0x0010_0000`).
 - **Tick Counter**: Increments an atomic 64-bit integer (`current_ticks() -> u64`) on every timer interrupt.
-- **Diagnostic Interval**: Emits `[TIMER] tick: N` every 100 ticks to avoid serial output saturation.
+- **Diagnostic Interval**: Emits `[TIMER] tick: N` every 100 ticks.
 
 ## Logging (`src/logger.rs`)
 
@@ -93,6 +97,9 @@ Disables interrupts via `platform::cli()`, formats the panic message and source 
 
 - `hlt()` / `halt() -> !` — Low-power CPU halt.
 - `sti()` / `cli()` — Hardware interrupt control.
+- `read_cr3()` / `write_cr3()` — Page table root manipulation.
+- `read_cr2()` — Page fault address retrieval.
+- `invlpg()` — Targeted TLB invalidation.
 - `are_interrupts_enabled() -> bool` & `without_interrupts<F, R>(f: F) -> R` — Interrupt state management.
 - `rdmsr()` / `wrmsr()` — Model-Specific Register read/write.
 - `inb`/`outb`, `inw`/`outw`, `inl`/`outl` — x86 I/O port primitives.
