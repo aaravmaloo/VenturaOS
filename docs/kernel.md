@@ -20,7 +20,7 @@ efi_main(image_handle, system_table)
        │
        ├─ initialize_logging()    ← logs startup banner
        ├─ initialize_platform()   ← logs platform details
-       ├─ initialize_memory()     ← logs physical memory statistics & ranges
+       ├─ initialize_memory()     ← logs memory stats & initializes PMM bitmap
        ├─ initialize_gdt()        ← installs Ventura GDT, TSS, reloads CS/SS/TR
        ├─ initialize_idt()        ← installs 256-entry IDT & exception/IRQ stubs
        ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC
@@ -30,19 +30,20 @@ efi_main(image_handle, system_table)
        └─ kernel_main_loop()      ← platform::hlt() loop
 ```
 
-## Physical Memory Discovery (`src/memory.rs`)
+## Physical Memory & Page Allocator (`src/memory.rs` & `src/pmm.rs`)
 
-Ventura parses the UEFI physical memory map to discover hardware RAM and determine allocatable regions:
+Ventura manages physical memory using a deterministic **Bitmap Physical Page Allocator**:
 - **Base Page Granularity**: `4096` bytes (`PAGE_SIZE = 4096`).
-- **Memory Classification**:
-  - `Usable`: Conventional physical RAM available for future physical page allocation.
-  - `LoaderCode` / `LoaderData`: Memory occupied by Ventura kernel binaries and boot data. Strictly excluded from free allocation.
-  - `BootServicesCode` / `BootServicesData`: Firmware boot services regions.
-  - `RuntimeServicesCode` / `RuntimeServicesData`: Firmware runtime services preserved for UEFI runtime calls.
-  - `AcpiReclaim` / `AcpiNvs`: ACPI tables and non-volatile storage.
-  - `Mmio`: Memory-mapped I/O regions (APIC, PCIe, VGA).
-  - `Reserved`: Architecture-reserved or defective hardware areas.
-- **Validation**: Rejects zero-length descriptors, checks for 64-bit arithmetic overflow on region boundaries, and computes total physical vs. usable bytes.
+- **Strong Type**: `PhysPage(pub u64)` encapsulates 4096-aligned physical addresses.
+- **Safety Invariant**: The bitmap initializes with all bits set to `USED` (`1`). Only validated, conventional RAM outside kernel code, data, BSS, and page 0 is marked `FREE` (`0`).
+- **Core API**:
+  - `pmm::allocate_physical_page() -> Option<PhysPage>`
+  - `pmm::free_physical_page(page: PhysPage) -> Result<(), PageFreeError>`
+- **Validation & Error Detection**:
+  - Rejects unaligned addresses (`PageFreeError::UnalignedAddress`).
+  - Rejects double frees (`PageFreeError::DoubleFree`).
+  - Rejects reserved/zero page frees (`PageFreeError::ReservedMemory`).
+  - Out-of-bounds protection (`PageFreeError::OutOfBounds`).
 
 ## Global Descriptor Table (GDT) & TSS (`src/gdt.rs`)
 

@@ -9,6 +9,7 @@ pub mod logger;
 pub mod memory;
 pub mod panic;
 pub mod platform;
+pub mod pmm;
 pub mod timer;
 
 type EfiHandle = *mut u8;
@@ -189,6 +190,8 @@ fn initialize_platform() {
 
 fn initialize_memory() {
     memory::log_diagnostics();
+    pmm::init();
+    pmm::test_allocator();
 }
 
 fn initialize_gdt() {

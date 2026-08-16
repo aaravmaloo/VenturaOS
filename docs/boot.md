@@ -68,8 +68,14 @@ qemu-system-x86_64 -cdrom ventura.iso -bios /path/to/OVMF.fd -m 256M
   Total physical  : 512 MiB (536870912 bytes)
   Usable memory   : 480 MiB (503316480 bytes)
   Reserved/system : 32 MiB (33554432 bytes)
-  [0x0000000000100000..0x0000000007fe0000] USABLE (129920 KiB)
-  ...
+[MEM] Physical page allocator initialized (Bitmap)
+  Page size       : 4096 bytes
+  Total pages     : 131072
+  Usable pages    : 122880
+  Free pages      : 122879
+  Used/reserved   : 8193
+[MEM] Testing physical page allocator...
+[MEM] Allocator self-tests passed successfully
 [BOOT] GDT initialized
 [BOOT] TSS initialized
 [BOOT] IDT initialized
