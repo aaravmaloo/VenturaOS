@@ -13,6 +13,7 @@ UEFI Firmware (OVMF / VirtualBox / VMware / PC)
        └─ boot/efiboot.img  (FAT image embedded in the ISO)
             └─ EFI/BOOT/BOOTX64.EFI  (compiled Rust x86_64 kernel)
                  └─ efi_main()  ← firmware calls this
+                      ├─ get_memory_map()
                       └─ kernel_main()
 ```
 
@@ -62,6 +63,13 @@ qemu-system-x86_64 -cdrom ventura.iso -bios /path/to/OVMF.fd -m 256M
 [BOOT] Ventura kernel starting (x86_64)
 [BOOT] Logging initialized
 [BOOT] Platform: x86_64 / UEFI boot services
+[MEM] UEFI physical memory map acquired
+  Total regions   : 42
+  Total physical  : 512 MiB (536870912 bytes)
+  Usable memory   : 480 MiB (503316480 bytes)
+  Reserved/system : 32 MiB (33554432 bytes)
+  [0x0000000000100000..0x0000000007fe0000] USABLE (129920 KiB)
+  ...
 [BOOT] GDT initialized
 [BOOT] TSS initialized
 [BOOT] IDT initialized

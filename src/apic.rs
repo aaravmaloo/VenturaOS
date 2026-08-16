@@ -3,14 +3,14 @@ use crate::platform;
 pub const LAPIC_DEFAULT_BASE: usize = 0xFEE0_0000;
 pub const IOAPIC_DEFAULT_BASE: usize = 0xFEC0_0000;
 
-pub const LAPIC_ID: u32        = 0x0020;
-pub const LAPIC_VER: u32       = 0x0030;
-pub const LAPIC_TPR: u32       = 0x0080;
-pub const LAPIC_EOI: u32       = 0x00B0;
-pub const LAPIC_LDR: u32       = 0x00D0;
-pub const LAPIC_DFR: u32       = 0x00E0;
-pub const LAPIC_SVR: u32       = 0x00F0;
-pub const LAPIC_ESR: u32       = 0x0280;
+pub const LAPIC_ID: u32 = 0x0020;
+pub const LAPIC_VER: u32 = 0x0030;
+pub const LAPIC_TPR: u32 = 0x0080;
+pub const LAPIC_EOI: u32 = 0x00B0;
+pub const LAPIC_LDR: u32 = 0x00D0;
+pub const LAPIC_DFR: u32 = 0x00E0;
+pub const LAPIC_SVR: u32 = 0x00F0;
+pub const LAPIC_ESR: u32 = 0x0280;
 pub const LAPIC_LVT_TIMER: u32 = 0x0320;
 pub const LAPIC_LVT_LINT0: u32 = 0x0350;
 pub const LAPIC_LVT_LINT1: u32 = 0x0360;
@@ -20,7 +20,7 @@ pub const LAPIC_TIMER_CCR: u32 = 0x0390;
 pub const LAPIC_TIMER_DCR: u32 = 0x03E0;
 
 pub const IOAPIC_REGSEL: usize = 0x00;
-pub const IOAPIC_IOWIN: usize  = 0x10;
+pub const IOAPIC_IOWIN: usize = 0x10;
 
 #[inline(always)]
 pub unsafe fn lapic_read(reg: u32) -> u32 {
