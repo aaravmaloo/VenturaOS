@@ -4,8 +4,9 @@ use crate::memory::{self, MemoryType, PAGE_SIZE};
 use crate::platform;
 use crate::pmm::{self, PhysPage};
 
-pub const DYNAMIC_VIRT_START: u64 = 0x0000_1000_0000_0000;
-pub const DYNAMIC_VIRT_END: u64   = 0x0000_7000_0000_0000;
+pub const KERNEL_PML4_START: usize = 256;
+pub const DYNAMIC_VIRT_START: u64 = 0xFFFF_8000_0000_0000; // PML4 slot 256
+pub const DYNAMIC_VIRT_END: u64   = 0xFFFF_FF80_0000_0000; // PML4 slot 511 reserved for high kernel mapping
 pub const MAX_VIRT_REGIONS: usize = 256;
 
 #[inline(always)]
@@ -958,6 +959,42 @@ pub fn init() {
     }
 
     klog!("[VM] CR3 switched to Ventura page tables successfully");
+
+    // 5. Pre-allocate kernel-half PDPTs so every AddressSpace shares them
+    klog!("[VM] Step 5: pre-allocating kernel-half PML4 entries ({}..511)...", KERNEL_PML4_START);
+    let created = platform::without_interrupts(|| unsafe {
+        let pml4 = &mut *(root_page.addr() as *mut PageTable);
+        let mut created = 0usize;
+        for i in KERNEL_PML4_START..512 {
+            let was_present = pml4.entries[i].is_present();
+            if get_or_create_table(&mut pml4.entries[i]).is_none() {
+                return None;
+            }
+            if !was_present {
+                created += 1;
+            }
+        }
+        Some(created)
+    });
+    match created {
+        Some(n) => klog!("[VM] Step 5 done: {} kernel PDPTs created", n),
+        None => {
+            klog!("[VM PANIC] Failed to pre-allocate kernel-half PML4 entries!");
+            platform::halt();
+        }
+    }
+}
+
+pub fn shares_kernel_half(root: PhysPage) -> bool {
+    let kernel_root = root_pml4_page();
+    unsafe {
+        let kernel_pml4 = &*(kernel_root.addr() as *const PageTable);
+        let pml4 = &*(root.addr() as *const PageTable);
+        (KERNEL_PML4_START..512).all(|i| {
+            kernel_pml4.entries[i].is_present()
+                && pml4.entries[i].phys_addr() == kernel_pml4.entries[i].phys_addr()
+        })
+    }
 }
 
 pub fn test_vmm() {

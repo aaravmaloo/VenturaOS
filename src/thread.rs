@@ -115,7 +115,7 @@ impl KernelThread {
             context: ExecutionContext::empty(),
             stack: KernelStack {
                 region: vmm::VirtRegion {
-                    start: vmm::VirtAddr::new(0x0000_2000_0000_0000),
+                    start: vmm::VirtAddr::new(vmm::DYNAMIC_VIRT_START),
                     size_bytes: 0x4000,
                     permissions: vmm::VirtPermissions::KERNEL_DATA,
                     purpose: vmm::RegionPurpose::DynamicKernel,
@@ -224,7 +224,7 @@ static mut MAIN_THREAD: KernelThread = KernelThread {
     context: ExecutionContext::empty(),
     stack: KernelStack {
         region: vmm::VirtRegion {
-            start: vmm::VirtAddr::new(0x0000_2000_0000_0000),
+            start: vmm::VirtAddr::new(vmm::DYNAMIC_VIRT_START),
             size_bytes: 0x4000,
             permissions: vmm::VirtPermissions::KERNEL_DATA,
             purpose: vmm::RegionPurpose::DynamicKernel,
@@ -243,7 +243,7 @@ static mut THREAD_A: KernelThread = KernelThread {
     context: ExecutionContext::empty(),
     stack: KernelStack {
         region: vmm::VirtRegion {
-            start: vmm::VirtAddr::new(0x0000_2000_0000_0000),
+            start: vmm::VirtAddr::new(vmm::DYNAMIC_VIRT_START),
             size_bytes: 0x4000,
             permissions: vmm::VirtPermissions::KERNEL_DATA,
             purpose: vmm::RegionPurpose::DynamicKernel,
@@ -262,7 +262,7 @@ static mut THREAD_B: KernelThread = KernelThread {
     context: ExecutionContext::empty(),
     stack: KernelStack {
         region: vmm::VirtRegion {
-            start: vmm::VirtAddr::new(0x0000_2000_0000_0000),
+            start: vmm::VirtAddr::new(vmm::DYNAMIC_VIRT_START),
             size_bytes: 0x4000,
             permissions: vmm::VirtPermissions::KERNEL_DATA,
             purpose: vmm::RegionPurpose::DynamicKernel,

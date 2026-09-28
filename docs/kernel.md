@@ -20,7 +20,7 @@ efi_main(image_handle, system_table)
        │
        ├─ initialize_logging()    ← logs startup banner
        ├─ initialize_platform()   ← logs platform details
-       ├─ initialize_memory()     ← PMM init -> VMM init (CR3 switch) -> Kernel Heap init
+       ├─ initialize_memory()     ← PMM init -> VMM init (CR3 switch) -> Kernel Heap init -> subsystem self-tests
        ├─ initialize_gdt()        ← installs Ventura GDT, TSS, reloads CS/SS/TR
        ├─ initialize_idt()        ← installs 256-entry IDT & exception/IRQ stubs
        ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC
@@ -52,18 +52,40 @@ Ventura M3.6 introduces comprehensive memory subsystem hardening, defensive inva
 
 ## Execution Context & Kernel Threads (`src/context.rs` & `src/thread.rs`)
 
-Ventura M4.1 & M4.2 establish kernel execution units and thread abstractions:
+Ventura M4.1–M4.4 establish kernel execution units, threads, and processes (M4.1 execution context, M4.2 kernel threads, M4.3 thread switching, M4.4 processes):
 - **`ExecutionContext` (`src/context.rs`)**: Software representation of preserved CPU state (`R15..R12`, `RBX`, `RBP`, `RSP`, `RIP`, `RFLAGS`, `state`, `id`). Enables low-level cooperative context switching via the `switch_context` assembly primitive.
-- **`KernelStack` (`src/context.rs`)**: Dedicated 16 KiB VMM-allocated supervisor stack (`READ + WRITE`) per execution unit with unmapped guard pages.
+- **`KernelStack` (`src/context.rs`)**: Dedicated 16 KiB VMM-allocated supervisor stack (`READ + WRITE`) per execution unit, placed in the shared kernel half. Stacks are allocated back to back and have no guard pages yet.
 - **`KernelThread` (`src/thread.rs`)**: Kernel thread abstraction wrapping thread identity (`id`), name, entry point `fn(usize)`, argument, state (`ThreadState`), context (`ExecutionContext`), and stack (`KernelStack`).
 - **`ThreadState` (`src/thread.rs`)**: Explicit lifecycle state tracking (`Created`, `Ready`, `Running`, `Blocked`, `Terminated`).
 - **`ThreadRegistry` (`src/thread.rs`)**: Thread ownership & lookup registry for tracking active kernel threads.
 - **`switch_to(current, target)` (`src/thread.rs`)**: High-level safe Rust manual context-switch primitive. Validates target context, stack pointer, RIP, and lifecycle state before atomically updating thread states and executing low-level assembly CPU state transition.
 - **Resume Point Integrity**: Verified that context switches resume execution at the exact instruction immediately following `switch_to` rather than restarting thread entry functions.
-- **`Process` (`src/process.rs`)**: Process execution container encapsulating unique Process ID (`PID`), process name, lifecycle state (`ProcessState`), owned threads (`Vec<KernelThread>`), and address space placeholder (`address_space_id = 0` for Shared Kernel Address Space).
+- **`Process` (`src/process.rs`)**: Process execution container encapsulating unique Process ID (`PID`), process name, lifecycle state (`ProcessState`), owned threads (`Vec<KernelThread>`), and its own `AddressSpace`. `Process::new()` returns `ProcessError::AddressSpaceCreationFailed` instead of panicking when no page-table root can be allocated.
 - **Process Invariant Validation (`Process::verify()`)**: Deep validation ensuring thread ownership integrity, thread ID uniqueness within process, matching `process_id` tags, and lifecycle state compatibility.
 - **Same & Cross-Process Context Switching**: Verified thread switching within the same process (`A1 -> A2 -> A1`) and across distinct processes (`A1 [Proc A] -> B1 [Proc B] -> A1 [Proc A]`).
 - **Deterministic Rollback**: Cleanly releases physical frames and virtual regions if stack allocation or context creation fails during thread construction.
+
+## Process Address Spaces (`src/address_space.rs`)
+
+Ventura M4.5 gives every process its own PML4 root:
+
+| PML4 Slots | Virtual Range | Ownership | Contents |
+|---|---|---|---|
+| `0` | `0x0000_0000_0000_0000..0x0000_0080_0000_0000` | Shared | 0–4 GB identity map, UEFI regions, MMIO, kernel image, page tables |
+| `1..255` | `0x0000_0080_0000_0000..0x0000_8000_0000_0000` | Per address space | Private mappings (future user space) |
+| `256..510` | `0xFFFF_8000_0000_0000..0xFFFF_FF80_0000_0000` | Shared | Kernel dynamic regions: heap, kernel stacks, `allocate_and_map_region` |
+| `511` | `0xFFFF_FF80_0000_0000..` | Shared | Reserved for high kernel mapping |
+
+- **Shared Kernel Half**: `vmm::init()` pre-allocates a PDPT for every kernel-half slot (`256..511`). `AddressSpace::new()` copies slot `0` and all kernel-half entries, so kernel mappings made at any time, even after the address space was created, are visible in every address space and survive a CR3 switch.
+- **`AddressSpace::activate()`**: Loads the space's PML4 into CR3 and records the current ASID.
+- **Private Mappings Only**: `map_page()` / `unmap_page()` reject addresses in shared slots with `AddressSpaceError::InvalidVirtualAddress`, so one address space can never modify another's view of kernel memory.
+- **Teardown (`destroy()` / `Drop`)**: Frees the root PML4 and every PDPT/PD/PT page under the private slots. Leaf frames are not freed; they belong to whoever mapped them, and any still mapped are reported as a warning. Destroying the active address space switches CR3 back to the bootstrap root first.
+- **Self-Tests (`address_space::run_self_tests()`)**:
+  - Unique ASIDs and root PML4s
+  - Same VA → different physical frames (isolation)
+  - Kernel heap and a kernel region mapped after address-space creation are readable after a CR3 switch
+  - Shared-slot mappings are rejected
+  - Teardown returns every page-table page to the PMM
 
 ## Global Descriptor Table (GDT) & TSS (`src/gdt.rs`)
 

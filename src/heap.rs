@@ -8,7 +8,7 @@ use crate::pmm::{self, PhysPage};
 use crate::vmm::{self, RegionPurpose, VirtAddr, VirtPermissions};
 
 pub const HEAP_MAGIC: u32 = 0x5645_4E54; // "VENT"
-pub const HEAP_START_ADDR: u64 = 0x0000_2000_0000_0000;
+pub const HEAP_START_ADDR: u64 = vmm::DYNAMIC_VIRT_START;
 pub const HEAP_INITIAL_PAGES: usize = 32; // 128 KiB initial heap
 pub const HEAP_GROWTH_STEP_PAGES: usize = 16; // 64 KiB per expansion
 pub const MIN_BLOCK_PAYLOAD: usize = 16;

@@ -1,8 +1,10 @@
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::klog;
+use crate::memory::PAGE_SIZE;
 use crate::platform;
 use crate::pmm::{self, PhysPage};
-use crate::vmm::{self, MapError, PageTable, PageTableFlags, UnmapError, VirtAddr};
+use crate::vmm::{self, MapError, PageTable, PageTableFlags, RegionPurpose, UnmapError, VirtAddr, VirtPermissions};
 
 static NEXT_ASID: AtomicU64 = AtomicU64::new(1); // ASID 0 reserved for bootstrap kernel space
 static CURRENT_ASID: AtomicU64 = AtomicU64::new(0);
@@ -47,8 +49,10 @@ impl AddressSpace {
 
             // PML4 index 0 contains shared kernel physical direct-map & MMIO regions
             new_pml4.entries[0] = kernel_pml4.entries[0];
-            // Copy index 511 for high kernel mapping
-            new_pml4.entries[511] = kernel_pml4.entries[511];
+            // Copy kernel half (256..511) for heap, kernel stacks & dynamic regions
+            for i in vmm::KERNEL_PML4_START..512 {
+                new_pml4.entries[i] = kernel_pml4.entries[i];
+            }
         }
 
         klog!("[AS] Created AddressSpace ASID {} (Root PML4={:#018x})", id, root_page.addr());
@@ -81,6 +85,9 @@ impl AddressSpace {
         phys_addr: PhysPage,
         flags: PageTableFlags,
     ) -> Result<(), AddressSpaceError> {
+        if !Self::is_private_addr(virt_addr) {
+            return Err(AddressSpaceError::InvalidVirtualAddress);
+        }
         vmm::map_page(self.root_page, virt_addr, phys_addr, flags)
             .map_err(AddressSpaceError::MappingFailed)
     }
@@ -89,6 +96,9 @@ impl AddressSpace {
         &mut self,
         virt_addr: VirtAddr,
     ) -> Result<PhysPage, AddressSpaceError> {
+        if !Self::is_private_addr(virt_addr) {
+            return Err(AddressSpaceError::InvalidVirtualAddress);
+        }
         vmm::unmap_page(self.root_page, virt_addr)
             .map_err(AddressSpaceError::UnmappingFailed)
     }
@@ -97,14 +107,82 @@ impl AddressSpace {
         vmm::translate(self.root_page, virt_addr)
     }
 
-    pub fn destroy(&mut self) {
-        if self.owns_root && self.root_page.addr() != 0 {
-            let _ = pmm::free_physical_page(self.root_page);
-            klog!("[AS] Destroyed AddressSpace ASID {}", self.id);
-            self.root_page = PhysPage::NULL;
-            self.owns_root = false;
-        }
+    // PML4 index 0 and the kernel half are shared with every address space
+    fn is_private_addr(virt_addr: VirtAddr) -> bool {
+        let slot = virt_addr.pml4_index();
+        slot != 0 && slot < vmm::KERNEL_PML4_START
     }
+
+    pub fn destroy(&mut self) {
+        if !self.owns_root || self.root_page.addr() == 0 {
+            return;
+        }
+
+        // Switch away before freeing the active page tables
+        let current_cr3 = unsafe { platform::read_cr3() } & !0xFFF;
+        if current_cr3 == self.root_page.addr() {
+            AddressSpace::bootstrap().activate();
+        }
+
+        let (freed_tables, leaf_pages) = unsafe { free_private_tables(self.root_page) };
+        let _ = pmm::free_physical_page(self.root_page);
+
+        if leaf_pages != 0 {
+            klog!("[AS WARN] ASID {} destroyed with {} leaf pages still mapped (frames not freed)", self.id, leaf_pages);
+        }
+        klog!("[AS] Destroyed AddressSpace ASID {} ({} page tables freed)", self.id, freed_tables + 1);
+        self.root_page = PhysPage::NULL;
+        self.owns_root = false;
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+// Leaf frames are not freed, they belong to whoever mapped them
+unsafe fn free_private_tables(root: PhysPage) -> (usize, usize) {
+    let is_table = |e: vmm::PageTableEntry| {
+        e.is_present() && (e.flags().0 & PageTableFlags::HUGE_PAGE.0) == 0
+    };
+
+    let pml4 = &mut *(root.addr() as *mut PageTable);
+    let mut freed = 0usize;
+    let mut leaves = 0usize;
+
+    for pml4_i in 1..vmm::KERNEL_PML4_START {
+        let pml4_e = pml4.entries[pml4_i];
+        if !pml4_e.is_present() {
+            continue;
+        }
+        let pdpt = &*(pml4_e.phys_addr() as *const PageTable);
+        for pdpt_e in pdpt.entries.iter() {
+            if !is_table(*pdpt_e) {
+                leaves += pdpt_e.is_present() as usize;
+                continue;
+            }
+            let pd = &*(pdpt_e.phys_addr() as *const PageTable);
+            for pd_e in pd.entries.iter() {
+                if !is_table(*pd_e) {
+                    leaves += pd_e.is_present() as usize;
+                    continue;
+                }
+                let pt = &*(pd_e.phys_addr() as *const PageTable);
+                leaves += pt.entries.iter().filter(|e| e.is_present()).count();
+                let _ = pmm::free_physical_page(PhysPage(pd_e.phys_addr()));
+                freed += 1;
+            }
+            let _ = pmm::free_physical_page(PhysPage(pdpt_e.phys_addr()));
+            freed += 1;
+        }
+        let _ = pmm::free_physical_page(PhysPage(pml4_e.phys_addr()));
+        freed += 1;
+        pml4.entries[pml4_i].clear();
+    }
+
+    (freed, leaves)
 }
 
 pub fn current_asid() -> u64 {
@@ -189,13 +267,77 @@ pub fn run_self_tests() {
 
     klog!("[AS] Same VA -> Different Physical Frames virtual memory isolation: PASS");
 
-    // 3. Clean up test frames and address spaces
+    // 3. Shared Kernel Half Test (Heap & Late Kernel Mappings)
+    let heap_probe = Box::new(0xC0FF_EE00_C0FF_EE00u64);
+    let heap_va = VirtAddr::new(&*heap_probe as *const u64 as u64 & !(PAGE_SIZE - 1));
+    let late_region = vmm::allocate_and_map_region(
+        PAGE_SIZE,
+        VirtPermissions::KERNEL_DATA,
+        RegionPurpose::DynamicKernel,
+    ).expect("late kernel region allocation failed");
+    let late_ptr = late_region.start.as_mut_ptr::<u64>();
+
+    let kernel_root = vmm::root_pml4_page();
+    for space in [&as_a, &as_b] {
+        if !vmm::shares_kernel_half(space.root_page)
+            || space.translate(heap_va).map(|t| t.0) != vmm::translate(kernel_root, heap_va).map(|t| t.0)
+            || space.translate(late_region.start).map(|t| t.0) != vmm::translate(kernel_root, late_region.start).map(|t| t.0)
+        {
+            klog!("[AS TEST FAILED] ASID {} does not share kernel mappings!", space.id);
+            platform::halt();
+        }
+    }
+
+    as_a.activate();
+    let heap_ok = unsafe { (&*heap_probe as *const u64).read_volatile() } == 0xC0FF_EE00_C0FF_EE00;
+    unsafe { late_ptr.write_volatile(0x5A5A_5A5A_5A5A_5A5A) };
+    as_b.activate();
+    let late_ok = unsafe { late_ptr.read_volatile() } == 0x5A5A_5A5A_5A5A_5A5A;
+    boot_as.activate();
+
+    if !heap_ok || !late_ok {
+        klog!("[AS TEST FAILED] Kernel heap or late kernel region unreadable after CR3 switch!");
+        platform::halt();
+    }
+    let _ = vmm::unmap_region(&late_region);
+    drop(heap_probe);
+    klog!("[AS] Kernel half shared across address spaces (heap + late mapping): PASS");
+
+    // 4. Shared PML4 Slot Rejection
+    let kernel_va = VirtAddr::new(vmm::DYNAMIC_VIRT_START);
+    let low_va = VirtAddr::new(0x0000_0000_4000_0000);
+    if as_a.map_page(kernel_va, frame_a, PageTableFlags::PRESENT) != Err(AddressSpaceError::InvalidVirtualAddress)
+        || as_a.map_page(low_va, frame_a, PageTableFlags::PRESENT) != Err(AddressSpaceError::InvalidVirtualAddress)
+    {
+        klog!("[AS TEST FAILED] AddressSpace allowed a mapping into a shared PML4 slot!");
+        platform::halt();
+    }
+    klog!("[AS] Shared kernel slots rejected for per-space mappings: PASS");
+
+    // 5. Clean up test frames and address spaces
     let _ = as_a.unmap_page(test_va);
     let _ = as_b.unmap_page(test_va);
     let _ = pmm::free_physical_page(frame_a);
     let _ = pmm::free_physical_page(frame_b);
     as_a.destroy();
     as_b.destroy();
+
+    // 6. AddressSpace Teardown Leak Test
+    let free_before = pmm::stats().free_pages;
+    {
+        let mut as_c = AddressSpace::new().expect("Failed to create AddressSpace C");
+        let frame_c = pmm::allocate_physical_page().expect("failed frame C");
+        as_c.map_page(test_va, frame_c, PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
+            .expect("map AS C failed");
+        let _ = as_c.unmap_page(test_va);
+        let _ = pmm::free_physical_page(frame_c);
+    }
+    let free_after = pmm::stats().free_pages;
+    if free_after != free_before {
+        klog!("[AS TEST FAILED] AddressSpace teardown leaked {} pages!", free_before as isize - free_after as isize);
+        platform::halt();
+    }
+    klog!("[AS] AddressSpace teardown frees all page-table pages: PASS");
 
     klog!("==============================================");
     klog!("[AS] Process Address Space self-tests: ALL PASSED");

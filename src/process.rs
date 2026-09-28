@@ -50,16 +50,17 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(name: &'static str) -> Self {
+    pub fn new(name: &'static str) -> Result<Self, ProcessError> {
+        let address_space = AddressSpace::new()
+            .map_err(|_| ProcessError::AddressSpaceCreationFailed)?;
         let id = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-        let address_space = AddressSpace::new().expect("AddressSpace creation failed");
-        Self {
+        Ok(Self {
             id,
             name,
             state: ProcessState::Created,
             threads: Vec::new(),
             address_space,
-        }
+        })
     }
 
     pub fn bootstrap() -> Self {
@@ -305,8 +306,8 @@ pub fn run_self_tests() {
     klog!("==============================================");
 
     // 1. Process Creation & Unique PIDs
-    let proc_a = Process::new("process_alpha");
-    let proc_b = Process::new("process_beta");
+    let proc_a = Process::new("process_alpha").expect("Process process_alpha creation failed");
+    let proc_b = Process::new("process_beta").expect("Process process_beta creation failed");
     klog!("  Process Alpha PID : {} (ASID: {})", proc_a.id, proc_a.address_space.id);
     klog!("  Process Beta  PID : {} (ASID: {})", proc_b.id, proc_b.address_space.id);
 
@@ -319,7 +320,7 @@ pub fn run_self_tests() {
     // 2. Multi-Thread Process Creation & Ownership
     unsafe {
         let pa = &mut *core::ptr::addr_of_mut!(PROC_A);
-        *pa = Process::new("proc_a_multithread");
+        *pa = Process::new("proc_a_multithread").expect("Process proc_a_multithread creation failed");
         let _ = pa.create_thread("thread_a1", test_same_proc_thread_a1, 10);
         let _ = pa.create_thread("thread_a2", test_same_proc_thread_a2, 20);
 
@@ -362,8 +363,8 @@ pub fn run_self_tests() {
     unsafe {
         let pa = &mut *core::ptr::addr_of_mut!(PROC_A);
         let pb = &mut *core::ptr::addr_of_mut!(PROC_B);
-        *pa = Process::new("proc_a");
-        *pb = Process::new("proc_b");
+        *pa = Process::new("proc_a").expect("Process proc_a creation failed");
+        *pb = Process::new("proc_b").expect("Process proc_b creation failed");
 
         let _ = pa.create_thread("thread_a1", test_cross_proc_thread_a1, 100);
         let _ = pb.create_thread("thread_b1", test_cross_proc_thread_b1, 200);
