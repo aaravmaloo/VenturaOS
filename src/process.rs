@@ -236,7 +236,7 @@ fn test_same_proc_thread_a2(_arg: usize) {
     unsafe {
         let pa = &mut *core::ptr::addr_of_mut!(PROC_A);
         let (a1_ptr, a2_ptr) = pa.get_two_threads_mut(0, 1).unwrap();
-        let _ = thread::switch_to(a2_ptr, a1_ptr);
+        thread::switch_or_halt(a2_ptr, a1_ptr);
     }
 }
 
@@ -245,14 +245,14 @@ fn test_same_proc_thread_a1(_arg: usize) {
     unsafe {
         let pa = &mut *core::ptr::addr_of_mut!(PROC_A);
         let (a1_ptr, a2_ptr) = pa.get_two_threads_mut(0, 1).unwrap();
-        let _ = thread::switch_to(a1_ptr, a2_ptr);
+        thread::switch_or_halt(a1_ptr, a2_ptr);
 
         klog!("[SAME-PROC A1] Resumed in Thread A1! Switching back to Main Process...");
         TEST_SWITCH_STAGE = 1;
         let main = &mut *core::ptr::addr_of_mut!(MAIN_PROC);
         let main_t = main.get_thread_mut(0).unwrap();
         let a1_ptr = pa.get_thread_mut(0).unwrap();
-        let _ = thread::switch_to(a1_ptr, main_t);
+        thread::switch_or_halt(a1_ptr, main_t);
     }
 }
 
@@ -269,7 +269,7 @@ fn test_cross_proc_thread_b1(_arg: usize) {
         let b1_ptr = pb.get_thread_mut(0).unwrap();
 
         TEST_SWITCH_STAGE = 2;
-        let _ = thread::switch_to(b1_ptr, a1_ptr);
+        thread::switch_or_halt(b1_ptr, a1_ptr);
     }
 }
 
@@ -285,7 +285,7 @@ fn test_cross_proc_thread_a1(_arg: usize) {
         let a1_ptr = pa.get_thread_mut(0).unwrap();
         let b1_ptr = pb.get_thread_mut(0).unwrap();
 
-        let _ = thread::switch_to(a1_ptr, b1_ptr);
+        thread::switch_or_halt(a1_ptr, b1_ptr);
 
         klog!("[CROSS-PROC A1] Resumed back in Process A! Switching to Main Process...");
         TEST_SWITCH_STAGE = 3;
@@ -296,7 +296,7 @@ fn test_cross_proc_thread_a1(_arg: usize) {
 
         let main_t = main.get_thread_mut(0).unwrap();
         let a1_ptr = pa.get_thread_mut(0).unwrap();
-        let _ = thread::switch_to(a1_ptr, main_t);
+        thread::switch_or_halt(a1_ptr, main_t);
     }
 }
 
@@ -348,7 +348,7 @@ pub fn run_self_tests() {
         let a1_ptr = pa.get_thread_mut(0).unwrap();
 
         TEST_SWITCH_STAGE = 0;
-        let _ = thread::switch_to(main_t, a1_ptr);
+        thread::switch_or_halt(main_t, a1_ptr);
 
         let stage = core::ptr::addr_of!(TEST_SWITCH_STAGE).read();
         if stage != 1 {
@@ -380,7 +380,7 @@ pub fn run_self_tests() {
         let a1_ptr = pa.get_thread_mut(0).unwrap();
 
         TEST_SWITCH_STAGE = 0;
-        let _ = thread::switch_to(main_t, a1_ptr);
+        thread::switch_or_halt(main_t, a1_ptr);
 
         let stage = core::ptr::addr_of!(TEST_SWITCH_STAGE).read();
         if stage != 3 {

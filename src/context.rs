@@ -203,6 +203,10 @@ pub unsafe extern "C" fn switch_context(
     next: *const ExecutionContext,
 ) {
     naked_asm!(
+        // Save resume RIP (caller return address) to prev context struct
+        "mov rax, [rsp]",
+        "mov [rcx + 56], rax",
+
         // 1. Save RFLAGS
         "pushfq",
 

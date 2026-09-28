@@ -213,6 +213,15 @@ pub fn active_thread_count() -> usize {
 
 // ── Self-Tests & Verifications for M4.3 ──────────────────────────────────────
 
+// Halts on a rejected switch so self-tests never fall through silently
+pub fn switch_or_halt(current: &mut KernelThread, target: &mut KernelThread) {
+    let (from, to) = (current.id, target.id);
+    if let Err(e) = switch_to(current, target) {
+        klog!("[SWITCH TEST FAILED] Thread {} -> Thread {} rejected: {:?}", from, to, e);
+        platform::halt();
+    }
+}
+
 static mut RESUME_MARKER: u32 = 0;
 static mut SWITCH_COUNT: u32 = 0;
 
@@ -282,7 +291,7 @@ fn test_resume_thread_a(_arg: usize) {
         let b_ptr = core::ptr::addr_of_mut!(THREAD_B);
 
         klog!("[RESUME TEST A] Switching to Thread B...");
-        let _ = switch_to(&mut *a_ptr, &mut *b_ptr);
+        switch_or_halt(&mut *a_ptr, &mut *b_ptr);
 
         // Resumed right after switch!
         let marker = core::ptr::addr_of!(RESUME_MARKER).read();
@@ -295,7 +304,7 @@ fn test_resume_thread_a(_arg: usize) {
         RESUME_MARKER = 3;
         klog!("[RESUME TEST A] Marker updated to 3. Switching to Main Thread...");
         let main_ptr = core::ptr::addr_of_mut!(MAIN_THREAD);
-        let _ = switch_to(&mut *a_ptr, &mut *main_ptr);
+        switch_or_halt(&mut *a_ptr, &mut *main_ptr);
     }
 }
 
@@ -312,7 +321,7 @@ fn test_resume_thread_b(_arg: usize) {
         klog!("[RESUME TEST B] Marker set to 2. Switching back to Thread A...");
         let a_ptr = core::ptr::addr_of_mut!(THREAD_A);
         let b_ptr = core::ptr::addr_of_mut!(THREAD_B);
-        let _ = switch_to(&mut *b_ptr, &mut *a_ptr);
+        switch_or_halt(&mut *b_ptr, &mut *a_ptr);
     }
 }
 
@@ -324,9 +333,9 @@ fn test_loop_thread_a(_arg: usize) {
 
         for _ in 0..5 {
             SWITCH_COUNT += 1;
-            let _ = switch_to(&mut *a_ptr, &mut *b_ptr);
+            switch_or_halt(&mut *a_ptr, &mut *b_ptr);
         }
-        let _ = switch_to(&mut *a_ptr, &mut *main_ptr);
+        switch_or_halt(&mut *a_ptr, &mut *main_ptr);
     }
 }
 
@@ -337,7 +346,7 @@ fn test_loop_thread_b(_arg: usize) {
 
         for _ in 0..5 {
             SWITCH_COUNT += 1;
-            let _ = switch_to(&mut *a_ptr, &mut *b_ptr);
+            switch_or_halt(&mut *a_ptr, &mut *b_ptr);
         }
     }
 }
@@ -368,7 +377,7 @@ pub fn run_self_tests() {
         RESUME_MARKER = 0;
         let main_ptr = core::ptr::addr_of_mut!(MAIN_THREAD);
         let a_ptr = core::ptr::addr_of_mut!(THREAD_A);
-        let _ = switch_to(&mut *main_ptr, &mut *a_ptr);
+        switch_or_halt(&mut *main_ptr, &mut *a_ptr);
 
         let final_marker = core::ptr::addr_of!(RESUME_MARKER).read();
         if final_marker != 3 {
@@ -387,7 +396,7 @@ pub fn run_self_tests() {
         SWITCH_COUNT = 0;
         let main_ptr = core::ptr::addr_of_mut!(MAIN_THREAD);
         let a_ptr = core::ptr::addr_of_mut!(THREAD_A);
-        let _ = switch_to(&mut *main_ptr, &mut *a_ptr);
+        switch_or_halt(&mut *main_ptr, &mut *a_ptr);
 
         let final_count = core::ptr::addr_of!(SWITCH_COUNT).read();
         if final_count != 10 {
