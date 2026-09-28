@@ -1,4 +1,4 @@
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::klog;
 use crate::memory::PAGE_SIZE;
@@ -162,16 +162,16 @@ pub fn create_context(
     create_context_raw(entry_point as u64, stack)
 }
 
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn initial_context_entry() -> ! {
-    asm!(
+    naked_asm!(
         // r12 holds entry_point, r13 holds context_id (restored by switch_context)
         "mov rcx, r12", // 1st arg for x86_64 Win64 ABI
         "mov rdx, r13", // 2nd arg for x86_64 Win64 ABI
         // 32-byte shadow space required by x86_64 Win64 ABI
         "sub rsp, 32",
         "call kernel_context_trampoline",
-        options(noreturn)
     );
 }
 
@@ -195,12 +195,14 @@ pub fn kernel_context_exit(id: u64) -> ! {
     }
 }
 
+// Naked so it is never inlined and `ret` always lands after the caller's `call`
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn switch_context(
     prev: *mut ExecutionContext,
     next: *const ExecutionContext,
 ) {
-    asm!(
+    naked_asm!(
         // 1. Save RFLAGS
         "pushfq",
 
@@ -241,9 +243,6 @@ pub unsafe extern "C" fn switch_context(
 
         // 7. Return to caller on the new stack
         "ret",
-        in("rcx") prev,
-        in("rdx") next,
-        options(noreturn)
     );
 }
 
@@ -387,6 +386,8 @@ pub fn run_self_tests() {
             "mov {}, r13",
             out(reg) reg_a_out,
             out(reg) reg_b_out,
+            out("r12") _,
+            out("r13") _,
         );
 
         if reg_a_out != 0x1212121212121212 || reg_b_out != 0x1313131313131313 {

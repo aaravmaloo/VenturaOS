@@ -404,12 +404,14 @@ pub fn run_self_tests() {
         let mut r13_val: u64 = 0;
 
         core::arch::asm!(
-            "mov r12, 0x1234_5678_9ABC_DEF0",
-            "mov r13, 0x0FED_CBA9_8765_4321",
+            "mov r12, 0x123456789ABCDEF0",
+            "mov r13, 0x0FEDCBA987654321",
             "mov {}, r12",
             "mov {}, r13",
             out(reg) r12_val,
             out(reg) r13_val,
+            out("r12") _,
+            out("r13") _,
         );
 
         if r12_val != 0x1234_5678_9ABC_DEF0 || r13_val != 0x0FED_CBA9_8765_4321 {
