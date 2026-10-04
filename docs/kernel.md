@@ -6,7 +6,14 @@ Target platform: UTM x86_64 Standard PC (Q35 + ICH9) with UEFI boot. See [boot.m
 
 The UEFI firmware transfers control to `efi_main(image_handle, system_table)` via the Microsoft x64 (`extern "efiapi"`) ABI.
 
-`efi_main` extracts `con_out` (`EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL`), initializes the atomic console logger, retrieves the UEFI physical memory map, and calls `kernel_main()`.
+`efi_main` is the only code that talks to the firmware (M5 platform handoff):
+1. Initializes the logger on `con_out` (`EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL`) and COM1.
+2. Locates the Graphics Output Protocol (GOP) and records the linear framebuffer.
+3. Finds the ACPI RSDP in the UEFI configuration table (ACPI 2.0 GUID preferred over 1.0).
+4. Fetches the final memory map and calls `ExitBootServices` (retried up to 4 times if the map key goes stale). Nothing is logged between the two calls.
+5. Disables interrupts, turns off the UEFI console, starts the framebuffer console, parses the final memory map, and calls `kernel_main()`.
+
+No UEFI boot service is called after step 4. Memory of type `BOOT_SERVICES_*` stays reserved because the firmware's page tables and the boot stack still live there.
 
 ## Initialization Sequence
 
@@ -15,18 +22,22 @@ efi_main(image_handle, system_table)
   │
   ├─ reset UEFI console
   ├─ logger::init(con_out)
-  ├─ get_memory_map()        ← captures firmware physical memory map
+  ├─ find_gop()               ← records GOP framebuffer
+  ├─ find_rsdp()              ← records ACPI RSDP
+  ├─ exit_boot_services()     ← final memory map + ExitBootServices
+  ├─ framebuffer::init()      ← screen console takes over from UEFI console
   ├─ memory::init_from_uefi() ← validates & categorizes physical memory
   │
   └─ kernel_main()
        │
        ├─ initialize_logging()    ← logs startup banner
-       ├─ initialize_platform()   ← logs platform details
+       ├─ initialize_platform()   ← logs platform & framebuffer details
+       ├─ initialize_acpi()       ← parses MADT, sets LAPIC / I/O APIC addresses
        ├─ initialize_memory()     ← PMM init -> VMM init (CR3 switch) -> Kernel Heap init -> subsystem self-tests
        ├─ initialize_gdt()        ← installs Ventura GDT, TSS, reloads CS/SS/TR
        ├─ initialize_idt()        ← installs 256-entry IDT & exception/IRQ stubs
-       ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC
-       ├─ initialize_timer()      ← registers IRQ 0 & starts LAPIC periodic timer
+       ├─ initialize_apic()       ← masks legacy PIC, initializes LAPIC & I/O APIC with ACPI overrides
+       ├─ initialize_timer()      ← calibrates LAPIC timer against PIT, starts it at 100 Hz
        ├─ platform::sti()         ← enables hardware interrupts
        │
        └─ kernel_main_loop()      ← platform::hlt() loop
@@ -38,6 +49,7 @@ Ventura M3.6 introduces comprehensive memory subsystem hardening, defensive inva
 - **PMM Invariant Checks (`pmm::verify_invariants()`)**: Validates `used_pages + free_pages == total_managed_pages`, verifies Page 0 remains reserved, and checks bitwise bitmap consistency.
 - **PMM Defensive Error Handling**: Rejects double-free, unaligned free, reserved page 0 free, and out-of-bounds page free attempts.
 - **Bootstrap Page Table Pool**: Utilizes a static 2 MiB BSS pool (`BOOTSTRAP_POOL`) for zero-fault page table setup under UEFI identity-mapping.
+- **Mapping Errors**: `vmm::map_page()` returns `FrameAllocationFailed` when a page table cannot be allocated and `AlreadyMapped` when the address is already covered (including by a 2 MiB huge page).
 - **VMM Page Table Validation (`vmm::verify_page_tables()`)**: Deep walks the 4-level PML4 hierarchy to verify 4KB alignment of all intermediate tables and leaf physical addresses.
 - **NULL Page Protection (`vmm::verify_null_page_unmapped()`)**: Guarantees virtual address `0x0` remains unmapped so null pointer dereferences trigger immediate Page Faults.
 - **Heap Invariant Validation (`heap::verify_invariants()`)**: Checks block header magic (`0x5645_4E54`), bidirectional doubly-linked list integrity (`curr.next.prev == curr`), 16-byte payload alignment, and byte accounting.
@@ -113,18 +125,35 @@ Ventura establishes its own flat 64-bit GDT with descriptors configured for mode
 | `48..254` | General / PCI | Generic unhandled external interrupt stub |
 | `255` (`0xFF`) | APIC Spurious | Local APIC Spurious Interrupt Vector |
 
+### ACPI Interrupt Routing
+
+`apic::configure_from_acpi()` takes the Local APIC address and the I/O APIC that owns GSI 0 from the MADT, falling back to `0xFEE0_0000` / `0xFEC0_0000` when there is no MADT. `init_ioapic()` masks every redirection entry, then re-routes each ISA IRQ listed in a MADT Interrupt Source Override to its GSI with the override's polarity and trigger mode (on Q35, ISA IRQ 0 → GSI 2). `route_irq()`, `mask_irq()` and `unmask_irq()` take ISA IRQ numbers and translate them through the overrides.
+
+## ACPI (`src/acpi.rs`)
+
+M5 reads the firmware's ACPI tables once, early in `kernel_main`, while physical memory is still identity mapped:
+- **RSDP → XSDT/RSDT**: validates RSDP and root table checksums; uses the XSDT on ACPI 2.0+.
+- **MADT (`APIC`)**: records the Local APIC address (including a 64-bit address override), enabled CPUs (APIC IDs), I/O APICs (address and GSI base), and Interrupt Source Overrides.
+- **`acpi::madt()`**: returns the parsed table, or `None` if ACPI was unavailable.
+- **`acpi::isa_irq_to_gsi(irq)`**: maps an ISA IRQ to its GSI and INTI flags.
+
 ## Hardware Timer & Monotonic Ticks (`src/timer.rs`)
 
-Ventura uses the built-in **Local APIC Timer** running in **Periodic Mode**:
+Ventura uses the built-in **Local APIC Timer** running in **Periodic Mode** at **100 Hz**:
 - **Vector**: `32` (`0x20` / IRQ 0).
 - **Divider**: Configured via `LAPIC_TIMER_DCR` to Divide by 16 (`0x03`).
-- **Initial Count**: Loaded into `LAPIC_TIMER_ICR` (`0x0010_0000`).
-- **Tick Counter**: Increments an atomic 64-bit integer (`current_ticks() -> u64`) on every timer interrupt.
-- **Diagnostic Interval**: Emits `[TIMER] tick: N` every 100 ticks.
+- **Calibration**: Runs PIT channel 2 as a 50 ms one-shot (gated through port `0x61`) while the LAPIC timer free-runs, then sets the initial count to `counts_per_second / 100`. If the PIT never fires, it falls back to `0x0010_0000`.
+- **Tick Counter**: Increments an atomic 64-bit integer (`current_ticks() -> u64`) on every timer interrupt; `uptime_ms()` converts ticks to milliseconds.
+- **Diagnostic Interval**: Emits `[TIMER] tick: N` every 100 ticks (once per second).
 
-## Logging (`src/logger.rs`)
+## Logging (`src/logger.rs`) & Framebuffer Console (`src/framebuffer.rs`)
 
-Provides the `klog!` macro backed by an `AtomicPtr<EfiSimpleTextOutput>` in writable memory, formatting directly into the UEFI console without heap allocations.
+`klog!` formats without heap allocations and writes to every active sink:
+1. **COM1 serial** (`0x3F8`, 38400 8N1), always. Visible in UTM only if a serial device is added to the VM.
+2. **Framebuffer console**, after `ExitBootServices`: draws text into the GOP linear framebuffer using the 8×8 font in `src/font.rs` (font8x8_basic, public domain), each glyph doubled vertically into an 8×16 cell, with scrolling. Supports 32-bit RGB, BGR and bitmask pixel formats; a blit-only GOP leaves only serial output.
+3. **UEFI text console** (`con_out`), until `ExitBootServices`.
+
+The framebuffer is identity mapped by `vmm::init()` (Step 2) together with the LAPIC and I/O APIC.
 
 ## Panic Handler (`src/panic.rs`)
 

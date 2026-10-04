@@ -1,7 +1,15 @@
+use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use crate::acpi;
+use crate::klog;
 use crate::platform;
 
+// Used only when ACPI provides no MADT
 pub const LAPIC_DEFAULT_BASE: usize = 0xFEE0_0000;
 pub const IOAPIC_DEFAULT_BASE: usize = 0xFEC0_0000;
+
+static LAPIC_BASE: AtomicUsize = AtomicUsize::new(LAPIC_DEFAULT_BASE);
+static IOAPIC_BASE: AtomicUsize = AtomicUsize::new(IOAPIC_DEFAULT_BASE);
+static IOAPIC_GSI_BASE: AtomicU32 = AtomicU32::new(0);
 
 pub const LAPIC_ID: u32 = 0x0020;
 pub const LAPIC_VER: u32 = 0x0030;
@@ -22,30 +30,65 @@ pub const LAPIC_TIMER_DCR: u32 = 0x03E0;
 pub const IOAPIC_REGSEL: usize = 0x00;
 pub const IOAPIC_IOWIN: usize = 0x10;
 
+const IOAPIC_ACTIVE_LOW: u32 = 1 << 13;
+const IOAPIC_LEVEL_TRIGGERED: u32 = 1 << 15;
+const IOAPIC_MASKED: u32 = 1 << 16;
+
+pub fn lapic_base() -> usize {
+    LAPIC_BASE.load(Ordering::Relaxed)
+}
+
+pub fn ioapic_base() -> usize {
+    IOAPIC_BASE.load(Ordering::Relaxed)
+}
+
+// Must run before vmm::init maps the APIC MMIO
+pub fn configure_from_acpi() {
+    let madt = match acpi::madt() {
+        Some(m) => m,
+        None => {
+            klog!("[APIC WARN] No MADT, using default LAPIC {:#x} / I/O APIC {:#x}", LAPIC_DEFAULT_BASE, IOAPIC_DEFAULT_BASE);
+            return;
+        }
+    };
+
+    if madt.lapic_address != 0 {
+        LAPIC_BASE.store(madt.lapic_address as usize, Ordering::Relaxed);
+    }
+
+    // Ventura drives the I/O APIC that owns GSI 0 (the ISA IRQs)
+    for i in 0..madt.ioapic_count {
+        if madt.ioapics[i].gsi_base == 0 {
+            IOAPIC_BASE.store(madt.ioapics[i].address as usize, Ordering::Relaxed);
+            IOAPIC_GSI_BASE.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 #[inline(always)]
 pub unsafe fn lapic_read(reg: u32) -> u32 {
-    let ptr = (LAPIC_DEFAULT_BASE + reg as usize) as *const u32;
+    let ptr = (lapic_base() + reg as usize) as *const u32;
     core::ptr::read_volatile(ptr)
 }
 
 #[inline(always)]
 pub unsafe fn lapic_write(reg: u32, value: u32) {
-    let ptr = (LAPIC_DEFAULT_BASE + reg as usize) as *mut u32;
+    let ptr = (lapic_base() + reg as usize) as *mut u32;
     core::ptr::write_volatile(ptr, value);
 }
 
 #[inline(always)]
 pub unsafe fn ioapic_read(reg: u8) -> u32 {
-    let regsel = (IOAPIC_DEFAULT_BASE + IOAPIC_REGSEL) as *mut u32;
-    let win = (IOAPIC_DEFAULT_BASE + IOAPIC_IOWIN) as *mut u32;
+    let regsel = (ioapic_base() + IOAPIC_REGSEL) as *mut u32;
+    let win = (ioapic_base() + IOAPIC_IOWIN) as *mut u32;
     core::ptr::write_volatile(regsel, reg as u32);
     core::ptr::read_volatile(win)
 }
 
 #[inline(always)]
 pub unsafe fn ioapic_write(reg: u8, value: u32) {
-    let regsel = (IOAPIC_DEFAULT_BASE + IOAPIC_REGSEL) as *mut u32;
-    let win = (IOAPIC_DEFAULT_BASE + IOAPIC_IOWIN) as *mut u32;
+    let regsel = (ioapic_base() + IOAPIC_REGSEL) as *mut u32;
+    let win = (ioapic_base() + IOAPIC_IOWIN) as *mut u32;
     core::ptr::write_volatile(regsel, reg as u32);
     core::ptr::write_volatile(win, value);
 }
@@ -84,36 +127,65 @@ pub unsafe fn eoi() {
 pub unsafe fn init_ioapic() {
     let ver = ioapic_read(0x01);
     let max_entries = ((ver >> 16) & 0xFF) + 1;
+    let gsi_base = IOAPIC_GSI_BASE.load(Ordering::Relaxed);
 
-    for i in 0..max_entries as u8 {
-        route_irq(i, 0x20 + i, 0, true);
+    // 1. Mask every redirection entry, GSI n -> vector 0x20 + n
+    for i in 0..max_entries {
+        write_redirection(i, 0x20 + i as u8, 0, IOAPIC_MASKED);
     }
+
+    // 2. Re-route ISA IRQs that ACPI moved to another GSI or polarity/trigger mode
+    if let Some(madt) = acpi::madt() {
+        for i in 0..madt.override_count {
+            let o = madt.overrides[i];
+            if o.gsi >= gsi_base && o.gsi - gsi_base < max_entries {
+                write_redirection(o.gsi - gsi_base, 0x20 + o.isa_irq, 0, IOAPIC_MASKED | inti_flags(o.flags));
+            }
+        }
+    }
+}
+
+fn inti_flags(flags: u16) -> u32 {
+    let mut bits = 0;
+    if flags & acpi::POLARITY_MASK == acpi::POLARITY_ACTIVE_LOW {
+        bits |= IOAPIC_ACTIVE_LOW;
+    }
+    if flags & acpi::TRIGGER_MASK == acpi::TRIGGER_LEVEL {
+        bits |= IOAPIC_LEVEL_TRIGGERED;
+    }
+    bits
+}
+
+unsafe fn write_redirection(pin: u32, vector: u8, dest_lapic_id: u8, bits: u32) {
+    let reg_low = (0x10 + 2 * pin) as u8;
+    let reg_high = (0x11 + 2 * pin) as u8;
+    ioapic_write(reg_low, vector as u32 | bits);
+    ioapic_write(reg_high, (dest_lapic_id as u32) << 24);
+}
+
+fn isa_irq_pin(irq: u8) -> u32 {
+    let (gsi, _) = acpi::isa_irq_to_gsi(irq);
+    gsi - IOAPIC_GSI_BASE.load(Ordering::Relaxed)
 }
 
 pub unsafe fn route_irq(irq: u8, vector: u8, dest_lapic_id: u8, masked: bool) {
-    let reg_low = 0x10 + 2 * irq;
-    let reg_high = 0x11 + 2 * irq;
-
-    let mut low: u32 = vector as u32;
+    let (_, flags) = acpi::isa_irq_to_gsi(irq);
+    let mut bits = inti_flags(flags);
     if masked {
-        low |= 1 << 16;
+        bits |= IOAPIC_MASKED;
     }
-
-    let high: u32 = (dest_lapic_id as u32) << 24;
-
-    ioapic_write(reg_low, low);
-    ioapic_write(reg_high, high);
+    write_redirection(isa_irq_pin(irq), vector, dest_lapic_id, bits);
 }
 
 pub unsafe fn unmask_irq(irq: u8) {
-    let reg_low = 0x10 + 2 * irq;
-    let low = ioapic_read(reg_low) & !(1 << 16);
+    let reg_low = (0x10 + 2 * isa_irq_pin(irq)) as u8;
+    let low = ioapic_read(reg_low) & !IOAPIC_MASKED;
     ioapic_write(reg_low, low);
 }
 
 pub unsafe fn mask_irq(irq: u8) {
-    let reg_low = 0x10 + 2 * irq;
-    let low = ioapic_read(reg_low) | (1 << 16);
+    let reg_low = (0x10 + 2 * isa_irq_pin(irq)) as u8;
+    let low = ioapic_read(reg_low) | IOAPIC_MASKED;
     ioapic_write(reg_low, low);
 }
 

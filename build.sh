@@ -56,10 +56,11 @@ mmd    -i "$ISO_ROOT/boot/efiboot.img" ::EFI
 mmd    -i "$ISO_ROOT/boot/efiboot.img" ::EFI/BOOT
 mcopy  -i "$ISO_ROOT/boot/efiboot.img" "$EFI_SRC" ::EFI/BOOT/BOOTX64.EFI
 
-rm -f "$ISO"
+ISO_TMP=$(mktemp)
+rm -f "$ISO_TMP"
 xorriso \
     -as mkisofs \
-    -o "$ISO" \
+    -o "$ISO_TMP" \
     -V "VENTURA_OS" \
     -e "boot/efiboot.img" \
     -no-emul-boot \
@@ -67,6 +68,9 @@ xorriso \
     "$ISO_ROOT" \
     2>/dev/null
 
+# Overwrite in place so the file UTM points at is never deleted
+cat "$ISO_TMP" > "$ISO"
+rm -f "$ISO_TMP"
 rm -rf "$ISO_ROOT"
 info "      ISO created: $ISO"
 

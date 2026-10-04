@@ -1,4 +1,6 @@
 use core::cell::UnsafeCell;
+use crate::apic;
+use crate::framebuffer;
 use crate::klog;
 use crate::memory::{self, MemoryType, PAGE_SIZE};
 use crate::platform;
@@ -374,26 +376,27 @@ pub fn advance_dynamic_cursor(new_end: u64) {
     });
 }
 
-unsafe fn get_or_create_table(entry: &mut PageTableEntry) -> Option<*mut PageTable> {
+unsafe fn get_or_create_table(entry: &mut PageTableEntry) -> Result<*mut PageTable, MapError> {
     if entry.is_present() {
+        // Already covered by a huge page mapping
         if (entry.flags().0 & PageTableFlags::HUGE_PAGE.0) != 0 {
-            return None;
+            return Err(MapError::AlreadyMapped);
         }
         let phys = entry.phys_addr();
-        Some(phys as *mut PageTable)
+        Ok(phys as *mut PageTable)
     } else {
         let frame = if IS_BOOTSTRAPPING {
-            allocate_bootstrap_table()?
+            allocate_bootstrap_table()
         } else {
-            pmm::allocate_physical_page()?
-        };
+            pmm::allocate_physical_page()
+        }.ok_or(MapError::FrameAllocationFailed)?;
         let table_ptr = frame.addr() as *mut PageTable;
         (*table_ptr).zero();
         entry.set(
             frame.addr(),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         );
-        Some(table_ptr)
+        Ok(table_ptr)
     }
 }
 
@@ -416,25 +419,9 @@ pub fn map_page(
     platform::without_interrupts(|| unsafe {
         let pml4 = &mut *(root_pml4_phys.addr() as *mut PageTable);
 
-        let pdpt_ptr = match get_or_create_table(&mut pml4.entries[virt_addr.pml4_index()]) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        let pd_ptr = match get_or_create_table(&mut (*pdpt_ptr).entries[virt_addr.pdpt_index()]) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        let pd_entry = &mut (*pd_ptr).entries[virt_addr.pd_index()];
-        if pd_entry.is_present() && (pd_entry.flags().0 & PageTableFlags::HUGE_PAGE.0) != 0 {
-            return Ok(());
-        }
-
-        let pt_ptr = match get_or_create_table(pd_entry) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        let pdpt_ptr = get_or_create_table(&mut pml4.entries[virt_addr.pml4_index()])?;
+        let pd_ptr = get_or_create_table(&mut (*pdpt_ptr).entries[virt_addr.pdpt_index()])?;
+        let pt_ptr = get_or_create_table(&mut (*pd_ptr).entries[virt_addr.pd_index()])?;
 
         let leaf_entry = &mut (*pt_ptr).entries[virt_addr.pt_index()];
         if leaf_entry.is_present() {
@@ -460,15 +447,8 @@ pub fn map_2mb_huge_page(
     platform::without_interrupts(|| unsafe {
         let pml4 = &mut *(root_pml4_phys.addr() as *mut PageTable);
 
-        let pdpt_ptr = match get_or_create_table(&mut pml4.entries[virt_addr.pml4_index()]) {
-            Some(p) => p,
-            None => return Err(MapError::FrameAllocationFailed),
-        };
-
-        let pd_ptr = match get_or_create_table(&mut (*pdpt_ptr).entries[virt_addr.pdpt_index()]) {
-            Some(p) => p,
-            None => return Err(MapError::FrameAllocationFailed),
-        };
+        let pdpt_ptr = get_or_create_table(&mut pml4.entries[virt_addr.pml4_index()])?;
+        let pd_ptr = get_or_create_table(&mut (*pdpt_ptr).entries[virt_addr.pdpt_index()])?;
 
         let pd_entry = &mut (*pd_ptr).entries[virt_addr.pd_index()];
         pd_entry.set(
@@ -910,37 +890,14 @@ pub fn init() {
 
     klog!("[VM] Step 1 done: {} regions identity-mapped", map.region_count);
 
-    // 2. Identity map essential hardware MMIO regions
-    klog!("[VM] Step 2: mapping LAPIC / IOAPIC / VGA MMIO...");
-    let _ = map_page(root_page, VirtAddr::new(0xFEE0_0000), PhysPage(0xFEE0_0000), PageTableFlags::MMIO);
-    let _ = map_page(root_page, VirtAddr::new(0xFEC0_0000), PhysPage(0xFEC0_0000), PageTableFlags::MMIO);
-    let mut vga_curr = 0x000A_0000u64;
-    while vga_curr < 0x0010_0000 {
-        let _ = map_page(root_page, VirtAddr::new(vga_curr), PhysPage(vga_curr), PageTableFlags::MMIO);
-        vga_curr += PAGE_SIZE;
+    // 2. Identity map essential hardware MMIO regions (addresses from ACPI MADT and UEFI GOP)
+    klog!("[VM] Step 2: mapping LAPIC / IOAPIC / framebuffer MMIO...");
+    identity_map_mmio(root_page, apic::lapic_base() as u64, PAGE_SIZE);
+    identity_map_mmio(root_page, apic::ioapic_base() as u64, PAGE_SIZE);
+    if let Some(fb) = framebuffer::info() {
+        identity_map_mmio(root_page, fb.phys_base, fb.size_bytes);
+        klog!("  Framebuffer     : {:#018x} ({} KiB)", fb.phys_base, fb.size_bytes / 1024);
     }
-
-    let _ = register_region(VirtRegion {
-        start: VirtAddr::new(0xFEE0_0000),
-        size_bytes: PAGE_SIZE,
-        permissions: VirtPermissions::MMIO,
-        purpose: RegionPurpose::Mmio,
-        owns_physical_pages: false,
-    });
-    let _ = register_region(VirtRegion {
-        start: VirtAddr::new(0xFEC0_0000),
-        size_bytes: PAGE_SIZE,
-        permissions: VirtPermissions::MMIO,
-        purpose: RegionPurpose::Mmio,
-        owns_physical_pages: false,
-    });
-    let _ = register_region(VirtRegion {
-        start: VirtAddr::new(0x000A_0000),
-        size_bytes: 0x6_0000,
-        permissions: VirtPermissions::MMIO,
-        purpose: RegionPurpose::Mmio,
-        owns_physical_pages: false,
-    });
 
     klog!("[VM] Step 2 done: MMIO regions mapped");
 
@@ -967,7 +924,7 @@ pub fn init() {
         let mut created = 0usize;
         for i in KERNEL_PML4_START..512 {
             let was_present = pml4.entries[i].is_present();
-            if get_or_create_table(&mut pml4.entries[i]).is_none() {
+            if get_or_create_table(&mut pml4.entries[i]).is_err() {
                 return None;
             }
             if !was_present {
@@ -981,6 +938,35 @@ pub fn init() {
         None => {
             klog!("[VM PANIC] Failed to pre-allocate kernel-half PML4 entries!");
             platform::halt();
+        }
+    }
+}
+
+fn identity_map_mmio(root_page: PhysPage, phys_start: u64, size_bytes: u64) {
+    let start = phys_start & !(PAGE_SIZE - 1);
+    let end = (phys_start + size_bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let mut curr = start;
+    while curr < end {
+        // Inside the 0..4 GB huge-page identity map this reports AlreadyMapped
+        if let Err(e) = map_page(root_page, VirtAddr::new(curr), PhysPage(curr), PageTableFlags::MMIO) {
+            if e != MapError::AlreadyMapped {
+                klog!("  [VM WARN] MMIO [{:#x}]: map_page error {:?}", curr, e);
+                return;
+            }
+        }
+        curr += PAGE_SIZE;
+    }
+
+    if let Err(e) = register_region(VirtRegion {
+        start: VirtAddr::new(start),
+        size_bytes: end - start,
+        permissions: VirtPermissions::MMIO,
+        purpose: RegionPurpose::Mmio,
+        owns_physical_pages: false,
+    }) {
+        if e != VmmError::RegionOverlaps {
+            klog!("  [VM WARN] MMIO [{:#x}]: register_region error {:?}", start, e);
         }
     }
 }
