@@ -1,5 +1,16 @@
 # Boot
 
+## Target Platform
+
+Ventura targets **UTM** only: an x86_64 **Standard PC (Q35 + ICH9)** virtual machine with UEFI boot. This is the only supported and tested platform.
+
+| Host | UTM mode | Speed |
+|---|---|---|
+| Apple Silicon Mac | **Emulate** (x86_64 CPU emulated in software) | Slow, but correct |
+| Intel Mac | **Virtualize** | Native speed |
+
+Device support is written against the hardware UTM's QEMU backend provides (Q35 chipset, Local APIC / I/O APIC, COM1 serial, GOP framebuffer, ACPI tables, virtio devices). VirtualBox, VMware, Hyper-V, cloud VMs and physical PCs are not supported.
+
 ## What happens when the VM starts
 
 The UEFI firmware (EDK2 / OVMF / TianoCore) initializes the hardware. On boot it scans
@@ -8,7 +19,7 @@ embedded FAT image inside it, and looks for `EFI/BOOT/BOOTX64.EFI` — the stand
 boot path for x86_64. It loads that executable into memory and transfers control to `efi_main()`.
 
 ```
-UEFI Firmware (OVMF / VirtualBox / VMware / PC)
+UEFI Firmware (UTM / EDK2 OVMF)
   └─ ventura.iso  (El Torito DVD)
        └─ boot/efiboot.img  (FAT image embedded in the ISO)
             └─ EFI/BOOT/BOOTX64.EFI  (compiled Rust x86_64 kernel)
@@ -29,33 +40,18 @@ calling convention used by UEFI on all x86_64 systems.
 | `boot/efiboot.img` | Embedded FAT filesystem containing `EFI/BOOT/BOOTX64.EFI` (UEFI boot path) |
 | `EFI/BOOT/BOOTX64.EFI` | Root ISO9660 copy for firmware that scans the filesystem directly |
 
-## Running on UTM (Apple Silicon Mac)
+## Running on UTM
 
 1. Open **UTM**.
-2. Click **Create a New Virtual Machine** → **Emulate**.
+2. Click **Create a New Virtual Machine** → **Emulate** (Apple Silicon) or **Virtualize** (Intel Mac).
 3. Select **Other**.
-4. Architecture: **x86_64 (Standard PC (Q35 + ICH9, 2009))** (or default standard PC).
+4. Architecture: **x86_64**, System: **Standard PC (Q35 + ICH9, 2009)**.
 5. Boot: **UEFI Boot** enabled.
 6. Memory: 256 MB or higher.
 7. Drives: Under CD/DVD Image, select `ventura.iso`.
 8. Start the VM.
 
-## Running on VirtualBox (Windows / Linux / Intel Mac)
-
-| Setting | Value |
-|---|---|
-| Type | Other / Unknown (64-bit) |
-| RAM | 256 MB minimum |
-| EFI | **Enabled** (System → Motherboard → Enable EFI) |
-| Storage | Attach `ventura.iso` as Optical / CD drive |
-| Boot order | Optical first |
-
-## Running on QEMU directly (macOS / Linux / Windows)
-
-```sh
-# Using QEMU with OVMF UEFI firmware
-qemu-system-x86_64 -cdrom ventura.iso -bios /path/to/OVMF.fd -m 256M
-```
+After rebuilding with `./build.sh`, restart the VM to boot the new `ventura.iso`.
 
 ## Expected Boot Output
 
@@ -84,8 +80,8 @@ qemu-system-x86_64 -cdrom ventura.iso -bios /path/to/OVMF.fd -m 256M
 [VM] Testing Virtual Memory Manager (VMM)...
 [VM] Virtual Memory Manager self-tests passed successfully
 [HEAP] Initializing kernel dynamic heap...
-  Heap Virtual Start : 0x0000200000000000
-  Heap Virtual End   : 0x0000200000020000
+  Heap Virtual Start : 0xffff800000000000
+  Heap Virtual End   : 0xffff800000020000
   Initial Capacity   : 128 KiB (32 pages)
 [HEAP] Kernel heap ready
 [HEAP] Testing kernel heap allocator...

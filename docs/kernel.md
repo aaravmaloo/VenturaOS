@@ -1,5 +1,7 @@
 # Kernel Internals (x86_64)
 
+Target platform: UTM x86_64 Standard PC (Q35 + ICH9) with UEFI boot. See [boot.md](boot.md#target-platform).
+
 ## Entry Point
 
 The UEFI firmware transfers control to `efi_main(image_handle, system_table)` via the Microsoft x64 (`extern "efiapi"`) ABI.
